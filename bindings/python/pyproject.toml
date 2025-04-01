@@ -1,18 +1,15 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "hfendpoint"
 version = "0.1.0"
-description = "hfendpoint binding"
-readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "MIT" }
+description = "hfendpoint lib"
 authors = [
-    { name = "angt", email = "angt@hf.co" },
+    { name = "angt", email = "angt@hf.co" }
 ]
-py_modules = ["hfendpoint"]
+requires-python = ">=3.12"
 dependencies = [
     "msgpack",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
