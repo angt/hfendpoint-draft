@@ -54,6 +54,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -65,5 +67,5 @@ jobs:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
           gh release create "$RELEASE_VERSION" release-assets/*/*.gz \
-             --title "secret ${RELEASE_VERSION#v}" \
+             --title "hfendpoint ${RELEASE_VERSION#v}" \
              --notes "Release based on tag ${RELEASE_VERSION}"
