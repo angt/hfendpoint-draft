@@ -1,0 +1,37 @@
+name: Rust Static Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  BINARY_NAME: hfendpoint
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        target: ${{ matrix.target }}
+
+    - name: Setup Zig
+      run: sudo snap install zig --classic --beta
+
+    - name: Build
+      run: |
+        cargo install cargo-zigbuild
+        cargo zigbuild --release --target ${{ matrix.target }}
+        target="${{ matrix.target }}"
+        name="hfendpoint-${target%%-*}-linux"
+        cp "target/${{ matrix.target }}/release/hfendpoint" "$name"
+        gzip -9 "$name"
