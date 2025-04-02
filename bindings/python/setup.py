@@ -14,10 +14,23 @@ VERSION = "0.1.0"
 URL = f"https://github.com/angt/hfendpoint-draft/releases/download/v{VERSION}"
 
 def get_binary_url():
+    system = platform.system()
+    if system == "Linux":
+        system = "linux"
+    elif system == "Darwin":
+        system = "macos"
+    else:
+        sys.exit(f"Unsupported system: {system}")
+
     machine = platform.machine()
-    if machine not in ["x86_64", "aarch64"]:
-        sys.exit(f"Unsupported architecture: {machine}")
-    return f"{NAME}-{machine}-linux.gz"
+    if machine == "aarch64" or machine == "arm64":
+        machine = "aarch64"
+    elif machine == "x86_64" or machine == "amd64":
+        machine = "x86_64"
+    else:
+        sys.exit(f"Unsupported machine: {machine}")
+
+    return f"{NAME}-{machine}-{system}.gz"
 
 class CustomInstallCommands(install_scripts):
     def run(self):
@@ -53,5 +66,10 @@ setup(
         "develop": develop,
         "install_scripts": CustomInstallCommands,
     },
-    platforms=["Linux_x86_64", "Linux_aarch64"],
+    platforms=[
+        "Linux_x86_64",
+        "Linux_aarch64",
+        "macOS_x86_64",
+        "macOS_aarch64",
+    ],
 )
