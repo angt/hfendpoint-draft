@@ -71,6 +71,8 @@ enum ApiError {
     Multipart(#[from] MultipartError),
     #[error("Invalid integer field: {0}")]
     InvalidIntField(#[from] ParseIntError),
+    #[error("Unsupported encoding format: {0}")]
+    UnsupportedEncodingFormat(String),
 }
 
 impl IntoResponse for ApiError {
@@ -102,6 +104,12 @@ impl IntoResponse for ApiError {
                 "invalid_request_error",
                 None,
                 format!("Invalid integer value provided in a request field: {}", e),
+            ),
+            ApiError::UnsupportedEncodingFormat(format) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("encoding_format"),
+                format!("Unsupported encoding format: '{}'. Only 'float' is currently supported.", format),
             ),
             _ => {
                 error!(error.message = %self, error.type = "api_error", "Internal Server Error occurred");
@@ -204,19 +212,55 @@ struct ChatResponse {
     choices: Vec<ChatChoice>,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    String(String),
+    StringArray(Vec<String>),
+}
+
+#[derive(Deserialize, Debug)]
+struct EmbeddingRequest {
+    input: EmbeddingInput,
+    model: String,
+    encoding_format: Option<String>,
+    dimensions: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EmbeddingObject {
+    object: String,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct UsageStats {
+    prompt_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EmbeddingResponse {
+    object: String,
+    data: Vec<EmbeddingObject>,
+    model: String,
+    usage: UsageStats,
+}
+
 #[derive(Serialize, Deserialize)]
 struct WorkerMessage<T> {
     id: u64,
     data: T,
 }
 
-struct WorkerResponse {
+struct Worker {
     id: u64,
     rx: mpsc::Receiver<Vec<u8>>,
     subs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
 }
 
-impl WorkerResponse {
+impl Worker {
     async fn next<T: DeserializeOwned>(&mut self) -> Result<T, ApiError> {
         let raw = self.rx.recv().await.ok_or(ApiError::ChannelClosed)?;
         let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw)?;
@@ -224,7 +268,7 @@ impl WorkerResponse {
     }
 }
 
-impl Drop for WorkerResponse {
+impl Drop for Worker {
     fn drop(&mut self) {
         let subs = self.subs.clone();
         let id = self.id;
@@ -248,7 +292,7 @@ impl AppState {
         name: &str,
         data: T,
         buffer_size: usize,
-    ) -> Result<WorkerResponse, ApiError> {
+    ) -> Result<Worker, ApiError> {
         let id = self.id_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(buffer_size);
         self.subs.lock().await.insert(id, tx);
@@ -273,7 +317,7 @@ impl AppState {
         );
         self.writer.lock().await.write_all(&raw).await?;
 
-        Ok(WorkerResponse {
+        Ok(Worker {
             id,
             rx,
             subs: self.subs.clone(),
@@ -446,6 +490,56 @@ async fn chat_completions(
     }
 }
 
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<EmbeddingRequest>,
+) -> Result<Json<EmbeddingResponse>, ApiError> {
+    let format = payload.encoding_format.unwrap_or("float".to_string());
+    if format != "float" {
+        return Err(ApiError::UnsupportedEncodingFormat(format));
+    }
+
+    #[derive(Serialize)]
+    struct WorkerRequest {
+        input: EmbeddingInput,
+        model: String,
+        dimensions: Option<u32>,
+    }
+    let request = WorkerRequest {
+        input: payload.input.clone(),
+        model: payload.model.clone(),
+        dimensions: payload.dimensions,
+    };
+    let mut worker = state.call("embeddings", request, 1).await?;
+
+    #[derive(Deserialize, Debug)]
+    struct WorkerResponse {
+        embeddings: Vec<Vec<f32>>,
+        usage: UsageStats,
+        model: String,
+    }
+    let response: WorkerResponse = worker.next().await?;
+
+    let data: Vec<EmbeddingObject> = response
+        .embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingObject {
+            object: "embedding".to_string(),
+            embedding,
+            index,
+        })
+        .collect();
+
+    let api_response = EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model: response.model,
+        usage: response.usage,
+    };
+    Ok(Json(api_response))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -521,6 +615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .with_state(state);
 
     let bind = format!("{}:{}", args.host, args.port);
