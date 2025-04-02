@@ -80,7 +80,10 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 Some("size"),
-                format!("Invalid value for 'size'. Expected format like '1024x1024', got: '{}'", val),
+                format!(
+                    "Invalid value for 'size'. Expected format like '1024x1024', got: '{}'",
+                    val
+                ),
             ),
             ApiError::MissingField(field) => (
                 StatusCode::BAD_REQUEST,
@@ -94,25 +97,21 @@ impl IntoResponse for ApiError {
                 None,
                 format!("Invalid multipart/form-data request: {}", e),
             ),
-             ApiError::InvalidIntField(e) => (
-                 StatusCode::BAD_REQUEST,
-                 "invalid_request_error",
-                 None,
-                 format!("Invalid integer value provided in a request field: {}", e),
-             ),
-             ApiError::Serialization(_) |
-             ApiError::Deserialization(_) | // Error deserializing worker response is an internal issue
-             ApiError::Io(_) |
-             ApiError::ChannelClosed | // Internal communication failure
-             ApiError::Json(_) => {
-                 error!(error.message = %self, error.type = "api_error", "Internal Server Error occurred");
-                 (
+            ApiError::InvalidIntField(e) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                None,
+                format!("Invalid integer value provided in a request field: {}", e),
+            ),
+            _ => {
+                error!(error.message = %self, error.type = "api_error", "Internal Server Error occurred");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_error",
                     None,
                     "An unexpected internal server error occurred.".to_string(),
-                 )
-             }
+                )
+            }
         };
         if status.is_client_error() {
             info!(error.message = %self, error.type = openai_error_type, param = ?param, "Client error occurred");
@@ -134,16 +133,16 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct GenerateRequest {
+#[derive(Deserialize)]
+struct ImagesGenerationsRequest {
     prompt: String,
     n: Option<u32>,
     size: Option<String>,
     response_format: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct GenerateResponse {
+#[derive(Serialize)]
+struct ImagesResponse {
     created: i64,
     data: Vec<ImageData>,
 }
@@ -154,16 +153,6 @@ struct ImageData {
     url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     b64_json: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ImageEditRequest {
-    prompt: String,
-    n: Option<u32>,
-    size: Option<String>,
-    response_format: Option<String>,
-    image: String,
-    mask: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -216,14 +205,7 @@ struct ChatResponse {
 }
 
 #[derive(Serialize, Deserialize)]
-struct MessageRequest<T> {
-    id: u64,
-    name: String,
-    data: T,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Message<T> {
+struct WorkerMessage<T> {
     id: u64,
     data: T,
 }
@@ -237,7 +219,7 @@ struct WorkerResponse {
 impl WorkerResponse {
     async fn next<T: DeserializeOwned>(&mut self) -> Result<T, ApiError> {
         let raw = self.rx.recv().await.ok_or(ApiError::ChannelClosed)?;
-        let msg: Message<T> = rmp_serde::from_slice(&raw)?;
+        let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw)?;
         Ok(msg.data)
     }
 }
@@ -271,12 +253,18 @@ impl AppState {
         let (tx, rx) = mpsc::channel(buffer_size);
         self.subs.lock().await.insert(id, tx);
 
-        let message = MessageRequest {
+        #[derive(Serialize)]
+        struct WorkerRequest<T> {
+            id: u64,
+            name: String,
+            data: T,
+        }
+        let request = WorkerRequest {
             id,
             name: name.into(),
             data,
         };
-        let raw = rmp_serde::to_vec_named(&message)?;
+        let raw = rmp_serde::to_vec_named(&request)?;
         info!(
             request_id = id,
             handler_name = name,
@@ -293,28 +281,29 @@ impl AppState {
     }
 }
 
+fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
+    size.split_once('x')
+        .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+        .ok_or(ApiError::InvalidSizeFormat(size.to_string()))
+}
+
 async fn images_generations(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<GenerateRequest>,
-) -> Result<Json<GenerateResponse>, ApiError> {
+    Json(payload): Json<ImagesGenerationsRequest>,
+) -> Result<Json<ImagesResponse>, ApiError> {
     let n = payload.n.unwrap_or(1);
-    let size_str = payload.size.unwrap_or("1024x1024".into());
     let response_format = payload.response_format.unwrap_or("b64_json".into());
-
-    let (width, height) = size_str
-        .split_once('x')
-        .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
-        .ok_or(ApiError::InvalidSizeFormat(size_str.clone()))?;
+    let (width, height) = parse_size(&payload.size.unwrap_or("1024x1024".into()))?;
 
     #[derive(Serialize)]
-    struct Request {
+    struct WorkerRequest {
         prompt: String,
         n: u32,
         width: u32,
         height: u32,
         response_format: String,
     }
-    let request = Request {
+    let request = WorkerRequest {
         prompt: payload.prompt,
         n,
         width,
@@ -328,7 +317,7 @@ async fn images_generations(
         data.push(worker.next::<ImageData>().await?);
     }
 
-    Ok(Json(GenerateResponse {
+    Ok(Json(ImagesResponse {
         created: Utc::now().timestamp(),
         data,
     }))
@@ -337,7 +326,7 @@ async fn images_generations(
 async fn images_editions(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
-) -> Result<Json<GenerateResponse>, ApiError> {
+) -> Result<Json<ImagesResponse>, ApiError> {
     let mut prompt = None;
     let mut n = None;
     let mut size = None;
@@ -345,7 +334,6 @@ async fn images_editions(
     let mut image = None;
     let mut mask = None;
 
-    // Extract fields from multipart data
     while let Some(field) = multipart.next_field().await? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -360,17 +348,12 @@ async fn images_editions(
     }
     let prompt = prompt.ok_or(ApiError::MissingField("prompt".into()))?;
     let n = n.unwrap_or(1);
-    let size_str = size.unwrap_or("1024x1024".into());
     let response_format = response_format.unwrap_or("b64_json".into());
     let image = image.ok_or(ApiError::MissingField("image".into()))?;
-
-    let (width, height) = size_str
-        .split_once('x')
-        .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
-        .ok_or(ApiError::InvalidSizeFormat(size_str.clone()))?;
+    let (width, height) = parse_size(&size.unwrap_or("1024x1024".into()))?;
 
     #[derive(Serialize)]
-    struct EditRequestWrapper {
+    struct WorkerRequest {
         prompt: String,
         n: u32,
         width: u32,
@@ -378,10 +361,10 @@ async fn images_editions(
         response_format: String,
         #[serde(with = "serde_bytes")]
         image: Vec<u8>,
-        #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none")] // Crucial
+        #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none")]
         mask: Option<Vec<u8>>,
     }
-    let request = EditRequestWrapper {
+    let request = WorkerRequest {
         prompt,
         n,
         width,
@@ -396,7 +379,7 @@ async fn images_editions(
     for _ in 0..n {
         data.push(worker.next::<ImageData>().await?);
     }
-    Ok(Json(GenerateResponse {
+    Ok(Json(ImagesResponse {
         created: Utc::now().timestamp(),
         data,
     }))
@@ -512,7 +495,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buf.extend_from_slice(&chunk[..n]);
                 let mut cursor = Cursor::new(&buf);
                 let mut consumed = 0;
-                while let Ok(msg) = rmp_serde::from_read::<_, Message<rmpv::Value>>(&mut cursor) {
+                while let Ok(msg) =
+                    rmp_serde::from_read::<_, WorkerMessage<rmpv::Value>>(&mut cursor)
+                {
                     let pos = cursor.position() as usize;
                     let raw = buf[consumed..pos].to_vec();
                     if let Some(sender) = subs.lock().await.get(&msg.id) {
