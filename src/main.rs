@@ -212,7 +212,7 @@ struct ChatResponse {
     choices: Vec<ChatChoice>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 enum EmbeddingInput {
     String(String),
@@ -227,7 +227,7 @@ struct EmbeddingRequest {
     dimensions: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Debug)]
 struct EmbeddingObject {
     object: String,
     embedding: Vec<f32>,
@@ -240,7 +240,7 @@ struct UsageStats {
     total_tokens: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Debug)]
 struct EmbeddingResponse {
     object: String,
     data: Vec<EmbeddingObject>,
@@ -498,15 +498,19 @@ async fn embeddings(
     if format != "float" {
         return Err(ApiError::UnsupportedEncodingFormat(format));
     }
+    let input = match payload.input {
+        EmbeddingInput::String(s) => vec![s],
+        EmbeddingInput::StringArray(arr) => arr,
+    };
 
     #[derive(Serialize)]
     struct WorkerRequest {
-        input: EmbeddingInput,
+        input: Vec<String>,
         model: String,
         dimensions: Option<u32>,
     }
     let request = WorkerRequest {
-        input: payload.input.clone(),
+        input,
         model: payload.model.clone(),
         dimensions: payload.dimensions,
     };
