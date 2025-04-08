@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::Utc;
 use clap::Parser;
-use interprocess::unnamed_pipe::tokio::{pipe, Sender};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,8 +27,10 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{unix::OwnedWriteHalf, UnixStream},
     process::Command,
-    sync::{mpsc, Mutex},
+    signal::unix::{signal, SignalKind},
+    sync::{mpsc, oneshot, Mutex},
 };
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -73,6 +75,10 @@ enum ApiError {
     InvalidIntField(#[from] ParseIntError),
     #[error("Unsupported encoding format: {0}")]
     UnsupportedEncodingFormat(String),
+    #[error("Worker cannot accept new requests.")]
+    WorkerUnavailable,
+    #[error("Failed to install signal handler: {0}")]
+    SignalSetup(std::io::Error),
 }
 
 impl IntoResponse for ApiError {
@@ -109,7 +115,16 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 Some("encoding_format"),
-                format!("Unsupported encoding format: '{}'. Only 'float' is currently supported.", format),
+                format!(
+                    "Unsupported encoding format: '{}'. Only 'float' is currently supported.",
+                    format
+                ),
+            ),
+            ApiError::WorkerUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                None,
+                "Please try again later.".to_string(),
             ),
             _ => {
                 error!(error.message = %self, error.type = "api_error", "Internal Server Error occurred");
@@ -281,7 +296,7 @@ impl Drop for Worker {
 }
 
 struct AppState {
-    writer: Mutex<Sender>,
+    writer: Mutex<Option<OwnedWriteHalf>>,
     subs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
     id_counter: AtomicU64,
 }
@@ -294,8 +309,6 @@ impl AppState {
         buffer_size: usize,
     ) -> Result<Worker, ApiError> {
         let id = self.id_counter.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(buffer_size);
-        self.subs.lock().await.insert(id, tx);
 
         #[derive(Serialize)]
         struct WorkerRequest<T> {
@@ -309,13 +322,17 @@ impl AppState {
             data,
         };
         let raw = rmp_serde::to_vec_named(&request)?;
-        info!(
-            request_id = id,
-            handler_name = name,
-            msg_size = raw.len(),
-            "Sending request to worker"
-        );
-        self.writer.lock().await.write_all(&raw).await?;
+        {
+            let mut writer_guard = self.writer.lock().await;
+
+            let sender = writer_guard.as_mut().ok_or(ApiError::WorkerUnavailable)?;
+
+            sender.write_all(&raw).await?;
+        }
+        info!(request_id = id, handler_name = name, "Request worker");
+
+        let (tx, rx) = mpsc::channel(buffer_size);
+        self.subs.lock().await.insert(id, tx);
 
         Ok(Worker {
             id,
@@ -544,6 +561,14 @@ async fn embeddings(
     Ok(Json(api_response))
 }
 
+fn raw_fd_no_cloexec(stream: &UnixStream) -> nix::Result<i32> {
+    let fd = stream.as_raw_fd();
+    let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
+    let new_flags = flags.difference(FdFlag::FD_CLOEXEC);
+    fcntl(fd, FcntlArg::F_SETFD(new_flags))?;
+    Ok(fd)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -551,33 +576,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .compact()
         .finish();
+
     tracing::subscriber::set_global_default(subscriber)
         .expect("Setting default tracing subscriber failed");
 
     let args = Args::parse();
-    let (write_request, request_fd) = pipe()?;
-    let (reply_fd, read_reply) = pipe()?;
 
-    let request_fd_raw = request_fd.as_raw_fd();
-    let reply_fd_raw = reply_fd.as_raw_fd();
+    let (sock, worker_sock) = UnixStream::pair()?;
+    let worker_fd = raw_fd_no_cloexec(&worker_sock)?;
 
     let mut child = Command::new(&args.worker_path)
         .args(&args.worker_args)
-        .env("HFENDPOINT_FD_REQUEST", request_fd_raw.to_string())
-        .env("HFENDPOINT_FD_REPLY", reply_fd_raw.to_string())
+        .env("HFENDPOINT_FD", worker_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .process_group(0)
         .spawn()?;
 
-    drop(request_fd);
-    drop(reply_fd);
+    drop(worker_sock);
+
+    let (read_reply, write_request) = sock.into_split();
 
     let state = Arc::new(AppState {
-        writer: Mutex::new(write_request),
+        writer: Mutex::new(Some(write_request)),
         subs: Arc::new(Mutex::new(HashMap::new())),
         id_counter: AtomicU64::new(1),
     });
+    let (worker_tx, worker_rx) = oneshot::channel();
 
     tokio::spawn({
         let subs = state.subs.clone();
@@ -588,6 +614,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(n) = reader.read(&mut chunk).await {
                 if n == 0 {
                     info!("Worker reply pipe closed (EOF). Reader task exiting.");
+                    let _ = worker_tx.send(());
                     break;
                 }
                 buf.extend_from_slice(&chunk[..n]);
@@ -620,12 +647,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/images/edits", post(images_editions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
-        .with_state(state);
+        .with_state(state.clone());
 
     let bind = format!("{}:{}", args.host, args.port);
     info!("Binding server to {}", bind);
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, app).await?;
+
+    let shutdown = {
+        let state = state.clone();
+
+        let mut sigint = signal(SignalKind::interrupt()).map_err(ApiError::SignalSetup)?;
+        let mut sigterm = signal(SignalKind::terminate()).map_err(ApiError::SignalSetup)?;
+
+        async move {
+            tokio::select! {
+                _ = sigint.recv() => info!("Received SIGINT, shutdown."),
+                _ = sigterm.recv() => info!("Received SIGTERM, shutdown."),
+                _ = worker_rx => info!("Worker exited, shutdown."),
+            };
+            let mut writer = state.writer.lock().await;
+            writer.take();
+        }
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+
     match child.wait().await {
         Ok(status) => println!("Worker exited with status: {}", status),
         Err(e) => eprintln!("Failed waiting for worker: {}", e),
