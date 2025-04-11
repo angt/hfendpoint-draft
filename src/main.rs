@@ -31,7 +31,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader},
     net::{unix::OwnedWriteHalf, UnixStream},
     process::Command,
     signal::unix::{signal, SignalKind},
@@ -740,7 +740,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .env("HFENDPOINT_FD", worker_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .process_group(0)
         .spawn()?;
 
@@ -793,6 +793,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    if let Some(stderr) = child.stderr.take() {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Some(line) = reader.next_line().await? {
+            error!("worker: {}", line);
+        }
+    }
     let app = Router::new()
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
