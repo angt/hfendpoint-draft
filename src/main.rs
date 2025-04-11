@@ -1,27 +1,32 @@
 use axum::{
+    body::Bytes,
     extract::multipart::MultipartError,
-    extract::Multipart,
+    extract::Path,
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
+use axum_typed_multipart::{TryFromMultipart, TypedMultipart};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use clap::Parser;
+use dashmap::DashMap;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    convert::TryFrom,
     io::Cursor,
     num::ParseIntError,
     os::unix::io::AsRawFd,
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
 };
 use thiserror::Error;
@@ -51,6 +56,10 @@ struct Args {
 
     /// Arguments to pass to the worker executable
     worker_args: Vec<String>,
+
+    /// Maximum memory capacity for images in bytes
+    #[clap(long, default_value = "1073741824")]
+    max_image_capacity: usize,
 }
 
 #[derive(Error, Debug)]
@@ -67,14 +76,12 @@ enum ApiError {
     Json(#[from] serde_json::Error),
     #[error("Invalid size format: {0}")]
     InvalidSizeFormat(String),
-    #[error("Missing Field: {0}")]
-    MissingField(String),
     #[error("Multipart error: {0}")]
     Multipart(#[from] MultipartError),
     #[error("Invalid integer field: {0}")]
     InvalidIntField(#[from] ParseIntError),
-    #[error("Unsupported encoding format: {0}")]
-    UnsupportedEncodingFormat(String),
+    #[error("Invalid value '{value}' for parameter '{param}'")]
+    InvalidParameterValue { param: String, value: String },
     #[error("Worker cannot accept new requests.")]
     WorkerUnavailable,
     #[error("Failed to install signal handler: {0}")]
@@ -93,12 +100,6 @@ impl IntoResponse for ApiError {
                     val
                 ),
             ),
-            ApiError::MissingField(field) => (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                Some(field.as_str()),
-                format!("Missing required parameter: '{}'", field),
-            ),
             ApiError::Multipart(e) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -111,14 +112,11 @@ impl IntoResponse for ApiError {
                 None,
                 format!("Invalid integer value provided in a request field: {}", e),
             ),
-            ApiError::UnsupportedEncodingFormat(format) => (
+            ApiError::InvalidParameterValue { param, value } => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                Some("encoding_format"),
-                format!(
-                    "Unsupported encoding format: '{}'. Only 'float' is currently supported.",
-                    format
-                ),
+                Some(param.as_str()),
+                format!("Invalid value '{value}' for parameter '{param}'"),
             ),
             ApiError::WorkerUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -154,6 +152,31 @@ impl IntoResponse for ApiError {
         let body = Json(serde_json::json!({ "error": error_payload }));
         (status, body).into_response()
     }
+}
+
+fn base_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("X-Forwarded-Proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|protos| protos.split(',').next())
+        .map(|proto| proto.trim())
+        .filter(|proto| !proto.is_empty())
+        .unwrap_or("http");
+
+    let authority = headers
+        .get("X-Forwarded-Host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|hosts| hosts.split(',').next())
+        .map(|host| host.trim())
+        .filter(|host| !host.is_empty());
+
+    if let Some(auth) = authority {
+        let base = format!("{}://{}", scheme, auth);
+        return base.trim_end_matches('/').to_string();
+    }
+    warn!("Could not determine host from headers.");
+    String::new()
 }
 
 #[derive(Deserialize)]
@@ -295,10 +318,48 @@ impl Drop for Worker {
     }
 }
 
+struct ImageStore {
+    data: DashMap<String, Bytes>,
+    queue: Mutex<VecDeque<String>>,
+    current_size: AtomicUsize,
+    max_capacity: usize,
+}
+
+impl ImageStore {
+    fn new(max_capacity: usize) -> Self {
+        Self {
+            data: DashMap::new(),
+            queue: Mutex::new(VecDeque::new()),
+            current_size: AtomicUsize::new(0),
+            max_capacity,
+        }
+    }
+
+    async fn insert(&self, id: String, image: Bytes) {
+        let size = image.len();
+        self.data.insert(id.clone(), image);
+        self.current_size.fetch_add(size, Ordering::Relaxed);
+
+        let mut queue = self.queue.lock().await;
+        queue.push_back(id);
+
+        let mut current = self.current_size.load(Ordering::Relaxed);
+        while current > self.max_capacity {
+            if let Some(old_id) = queue.pop_front() {
+                if let Some((_, old_img)) = self.data.remove(&old_id) {
+                    current = current.saturating_sub(old_img.len());
+                }
+            }
+        }
+        self.current_size.store(current, Ordering::Relaxed);
+    }
+}
+
 struct AppState {
     writer: Mutex<Option<OwnedWriteHalf>>,
     subs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
     id_counter: AtomicU64,
+    image_store: ImageStore,
 }
 
 impl AppState {
@@ -348,12 +409,66 @@ fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
         .ok_or(ApiError::InvalidSizeFormat(size.to_string()))
 }
 
+#[derive(Deserialize)]
+struct Png {
+    #[serde(with = "serde_bytes")]
+    png: Vec<u8>,
+}
+
+#[derive(Copy, Clone)]
+enum ImageResponseFormat {
+    Url,
+    B64Json,
+}
+
+impl TryFrom<Option<String>> for ImageResponseFormat {
+    type Error = ApiError;
+
+    fn try_from(opt: Option<String>) -> Result<Self, Self::Error> {
+        let format = opt.unwrap_or_else(|| "b64_json".to_string());
+        match format.as_str() {
+            "url" => Ok(ImageResponseFormat::Url),
+            "b64_json" => Ok(ImageResponseFormat::B64Json),
+            bad => Err(ApiError::InvalidParameterValue {
+                param: "response_format".to_string(),
+                value: bad.to_string(),
+            }),
+        }
+    }
+}
+
+async fn process_image_response(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    worker_id: u64,
+    image_id: u32,
+    image_bytes: Bytes,
+    format: ImageResponseFormat,
+) -> ImageData {
+    match format {
+        ImageResponseFormat::B64Json => ImageData {
+            b64_json: Some(STANDARD.encode(&image_bytes)),
+            url: None,
+        },
+        ImageResponseFormat::Url => {
+            let id = format!("{}-{}", worker_id, image_id);
+            let url = format!("{}/images/{}", base_url(headers), id);
+            state.image_store.insert(id, image_bytes).await;
+            ImageData {
+                url: Some(url),
+                b64_json: None,
+            }
+        }
+    }
+}
+
 async fn images_generations(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<ImagesGenerationsRequest>,
 ) -> Result<Json<ImagesResponse>, ApiError> {
     let n = payload.n.unwrap_or(1);
-    let response_format = payload.response_format.unwrap_or("b64_json".into());
+    let response_format = ImageResponseFormat::try_from(payload.response_format)?;
     let (width, height) = parse_size(&payload.size.unwrap_or("1024x1024".into()))?;
 
     #[derive(Serialize)]
@@ -362,20 +477,30 @@ async fn images_generations(
         n: u32,
         width: u32,
         height: u32,
-        response_format: String,
     }
     let request = WorkerRequest {
         prompt: payload.prompt,
         n,
         width,
         height,
-        response_format,
     };
     let mut worker = state.call("images_generations", request, n as _).await?;
-
     let mut data = Vec::with_capacity(n as usize);
-    for _ in 0..n {
-        data.push(worker.next::<ImageData>().await?);
+
+    for image_id in 0..n {
+        let image = worker.next::<Png>().await?;
+        let image_bytes = Bytes::from(image.png);
+        data.push(
+            process_image_response(
+                &state,
+                &headers,
+                worker.id,
+                image_id,
+                image_bytes,
+                response_format,
+            )
+            .await,
+        );
     }
 
     Ok(Json(ImagesResponse {
@@ -384,34 +509,28 @@ async fn images_generations(
     }))
 }
 
+#[derive(TryFromMultipart)]
+struct ImageEditionsRequestData {
+    prompt: String,
+    n: Option<String>,
+    size: Option<String>,
+    response_format: Option<String>,
+    image: Bytes,
+    mask: Option<Bytes>,
+}
+
 async fn images_editions(
     State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
+    headers: HeaderMap,
+    TypedMultipart(payload): TypedMultipart<ImageEditionsRequestData>,
 ) -> Result<Json<ImagesResponse>, ApiError> {
-    let mut prompt = None;
-    let mut n = None;
-    let mut size = None;
-    let mut response_format = None;
-    let mut image = None;
-    let mut mask = None;
-
-    while let Some(field) = multipart.next_field().await? {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "prompt" => prompt = Some(field.text().await?),
-            "n" => n = Some(field.text().await?.parse::<u32>()?),
-            "size" => size = Some(field.text().await?),
-            "response_format" => response_format = Some(field.text().await?),
-            "image" => image = Some(field.bytes().await?.to_vec()),
-            "mask" => mask = Some(field.bytes().await?.to_vec()),
-            _ => {}
-        }
-    }
-    let prompt = prompt.ok_or(ApiError::MissingField("prompt".into()))?;
-    let n = n.unwrap_or(1);
-    let response_format = response_format.unwrap_or("b64_json".into());
-    let image = image.ok_or(ApiError::MissingField("image".into()))?;
-    let (width, height) = parse_size(&size.unwrap_or("1024x1024".into()))?;
+    let n = payload
+        .n
+        .map(|s| s.parse::<u32>())
+        .transpose()?
+        .unwrap_or(1);
+    let response_format = ImageResponseFormat::try_from(payload.response_format)?;
+    let (width, height) = parse_size(&payload.size.unwrap_or("1024x1024".into()))?;
 
     #[derive(Serialize)]
     struct WorkerRequest {
@@ -419,31 +538,59 @@ async fn images_editions(
         n: u32,
         width: u32,
         height: u32,
-        response_format: String,
         #[serde(with = "serde_bytes")]
         image: Vec<u8>,
         #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none")]
         mask: Option<Vec<u8>>,
     }
     let request = WorkerRequest {
-        prompt,
+        prompt: payload.prompt,
         n,
         width,
         height,
-        response_format,
-        image,
-        mask,
+        image: payload.image.to_vec(),
+        mask: payload.mask.map(|b| b.to_vec()),
     };
     let mut worker = state.call("images_editions", request, n as _).await?;
-
     let mut data = Vec::with_capacity(n as usize);
-    for _ in 0..n {
-        data.push(worker.next::<ImageData>().await?);
+
+    for image_id in 0..n {
+        let image = worker.next::<Png>().await?;
+        let image_bytes = Bytes::from(image.png);
+        data.push(
+            process_image_response(
+                &state,
+                &headers,
+                worker.id,
+                image_id,
+                image_bytes,
+                response_format,
+            )
+            .await,
+        );
     }
     Ok(Json(ImagesResponse {
         created: Utc::now().timestamp(),
         data,
     }))
+}
+
+async fn images(
+    State(state): State<Arc<AppState>>,
+    Path(image_id): Path<String>,
+) -> Result<Response, StatusCode> {
+    match state.image_store.data.get(&image_id) {
+        Some(image_data_ref) => {
+            let bytes = image_data_ref.value().clone();
+            Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "image/png")],
+                bytes,
+            )
+                .into_response())
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn chat_completions(
@@ -511,9 +658,12 @@ async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
-    let format = payload.encoding_format.unwrap_or("float".to_string());
-    if format != "float" {
-        return Err(ApiError::UnsupportedEncodingFormat(format));
+    let encoding_format = payload.encoding_format.unwrap_or("float".to_string());
+    if encoding_format != "float" {
+        return Err(ApiError::InvalidParameterValue {
+            param: "encoding_format".to_string(),
+            value: encoding_format,
+        });
     }
     let input = match payload.input {
         EmbeddingInput::String(s) => vec![s],
@@ -602,6 +752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer: Mutex::new(Some(write_request)),
         subs: Arc::new(Mutex::new(HashMap::new())),
         id_counter: AtomicU64::new(1),
+        image_store: ImageStore::new(args.max_image_capacity),
     });
     let (worker_tx, worker_rx) = oneshot::channel();
 
@@ -647,6 +798,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/images/edits", post(images_editions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/images/{image_id}", get(images))
         .with_state(state.clone());
 
     let bind = format!("{}:{}", args.host, args.port);

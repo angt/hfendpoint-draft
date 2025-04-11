@@ -32,7 +32,6 @@ def run(handler):
                 unpacker.feed(data)
                 for message in unpacker:
                     try:
-                        print(message)
                         request_id = message["id"]
                         request_name = message["name"]
                         request_data = message["data"]
