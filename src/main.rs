@@ -793,12 +793,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    if let Some(stderr) = child.stderr.take() {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Some(line) = reader.next_line().await? {
-            error!("worker: {}", line);
-        }
-    }
+    let stderr_handle = if let Some(stderr) = child.stderr.take() {
+        Some(tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                error!("worker stderr: {}", line);
+            }
+            info!("Worker stderr stream finished.");
+        }))
+    } else {
+        None
+    };
     let app = Router::new()
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
@@ -832,6 +837,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown)
         .await?;
 
+    if let Some(stderr) = stderr_handle {
+        let _ = stderr.await;
+    }
     match child.wait().await {
         Ok(status) => println!("Worker exited with status: {}", status),
         Err(e) => eprintln!("Failed waiting for worker: {}", e),
