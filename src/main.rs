@@ -31,7 +31,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{unix::OwnedWriteHalf, UnixStream},
     process::Command,
     signal::unix::{signal, SignalKind},
@@ -86,6 +86,10 @@ enum ApiError {
     WorkerUnavailable,
     #[error("Failed to install signal handler: {0}")]
     SignalSetup(std::io::Error),
+    #[error("Worker process failed: {0}")]
+    WorkerError(String),
+    #[error("Internal server error: {0}")]
+    InternalServerError(String),
 }
 
 impl IntoResponse for ApiError {
@@ -124,6 +128,18 @@ impl IntoResponse for ApiError {
                 None,
                 "Please try again later.".to_string(),
             ),
+            ApiError::WorkerError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                None,
+                format!("Worker error: {}", msg),
+            ),
+            ApiError::InternalServerError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                None,
+                msg.clone(),
+            ),
             _ => {
                 error!(error.message = %self, error.type = "api_error", "Internal Server Error occurred");
                 (
@@ -134,7 +150,9 @@ impl IntoResponse for ApiError {
                 )
             }
         };
-        if status.is_client_error() {
+        if status.is_server_error() {
+            error!(error.message = %self, error.type = openai_error_type, param = ?param, "Server/Worker error occurred");
+        } else if status.is_client_error() {
             info!(error.message = %self, error.type = openai_error_type, param = ?param, "Client error occurred");
         }
         let mut error_payload = serde_json::json!({
@@ -289,7 +307,8 @@ struct EmbeddingResponse {
 #[derive(Serialize, Deserialize)]
 struct WorkerMessage<T> {
     id: u64,
-    data: T,
+    data: Option<T>,
+    error: Option<String>,
 }
 
 struct Worker {
@@ -301,8 +320,27 @@ struct Worker {
 impl Worker {
     async fn next<T: DeserializeOwned>(&mut self) -> Result<T, ApiError> {
         let raw = self.rx.recv().await.ok_or(ApiError::ChannelClosed)?;
-        let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw)?;
-        Ok(msg.data)
+        let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw).map_err(|e| {
+            error!("Failed to deserialize worker message: {}", e);
+            ApiError::Deserialization(e)
+        })?;
+        if let Some(err_msg) = msg.error {
+            warn!(request_id = msg.id, "Worker reported error: {}", err_msg);
+            return Err(ApiError::WorkerError(err_msg));
+        }
+        match msg.data {
+            Some(data) => Ok(data),
+            None => {
+                error!(
+                    request_id = msg.id,
+                    "Worker sent null data without an explicit error for type {}",
+                    std::any::type_name::<T>()
+                );
+                Err(ApiError::InternalServerError(
+                    "Worker returned no data and no error".to_string(),
+                ))
+            }
+        }
     }
 }
 

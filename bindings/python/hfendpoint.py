@@ -2,6 +2,9 @@ import os
 import select
 import msgpack
 
+class WorkerError(Exception):
+    pass
+
 def run(handler):
     fd = int(os.environ["HFENDPOINT_FD"])
     unpacker = msgpack.Unpacker()
@@ -12,6 +15,12 @@ def run(handler):
         reply_message = {"id": request_id, "data": chunk}
         reply_packed = msgpack.packb(reply_message, use_bin_type=True)
         reply_buffer.extend(reply_packed)
+
+    def send_error(request_id, error_message):
+        nonlocal reply_buffer
+        error_reply = {"id": request_id, "error": error_message}
+        error_packed = msgpack.packb(error_reply, use_bin_type=True)
+        reply_buffer.extend(error_packed)
 
     read_fds = [fd]
 
@@ -35,6 +44,7 @@ def run(handler):
                         request_id = message["id"]
                         request_name = message["name"]
                         request_data = message["data"]
+
                         if request_name in handler:
                             handler[request_name](
                                 request_data,
@@ -42,6 +52,13 @@ def run(handler):
                             )
                         else:
                             print(f"No handler for {request_name}")
+                    except WorkerError as e:
+                        if request_id is not None:
+                            error_msg = str(e)
+                            print(f"WorkerError for request {request_id}: {error_msg}")
+                            send_error(request_id, error_msg)
+                        else:
+                            print(f"WorkerError occurred but could not determine request ID: {e}")
                     except Exception as e:
                         print(f"Error processing request {request_id}: {e}")
 
