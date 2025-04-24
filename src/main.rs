@@ -28,6 +28,7 @@ use std::{
     process::Stdio,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
+    time::Instant,
 };
 use thiserror::Error;
 use tokio::{
@@ -315,6 +316,7 @@ struct Worker {
     id: u64,
     rx: mpsc::Receiver<Vec<u8>>,
     subs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    start_time: Instant,
 }
 
 impl Worker {
@@ -348,9 +350,15 @@ impl Drop for Worker {
     fn drop(&mut self) {
         let subs = self.subs.clone();
         let id = self.id;
+        let start_time = self.start_time;
         tokio::spawn(async move {
             if subs.lock().await.remove(&id).is_some() {
-                info!(request_id = id, "Subscription removed.");
+                let duration = start_time.elapsed();
+                info!(
+                    request_id = id,
+                    duration_ms = duration.as_millis(),
+                    "Subscription removed."
+                );
             };
         });
     }
@@ -421,11 +429,10 @@ impl AppState {
             data,
         };
         let raw = rmp_serde::to_vec_named(&request)?;
+        let start_time = Instant::now();
         {
             let mut writer_guard = self.writer.lock().await;
-
             let sender = writer_guard.as_mut().ok_or(ApiError::WorkerUnavailable)?;
-
             sender.write_all(&raw).await?;
         }
         info!(request_id = id, handler_name = name, "Request worker");
@@ -437,6 +444,7 @@ impl AppState {
             id,
             rx,
             subs: self.subs.clone(),
+            start_time,
         })
     }
 }
