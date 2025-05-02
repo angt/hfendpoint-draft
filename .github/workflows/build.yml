@@ -35,9 +35,9 @@ jobs:
       id: build
       run: |
         target="${{ matrix.target }}"
-        cargo zigbuild --release --target "$target"
+        cargo zigbuild --profile release-opt --target "$target"
         name="${{ env.BINARY_NAME }}-${target%%-*}-linux"
-        cp "target/${target}/release/${{ env.BINARY_NAME }}" "$name"
+        cp "target/${target}/release-opt/${{ env.BINARY_NAME }}" "$name"
         gzip -9 "$name"
         echo "asset_name=$name.gz" >> $GITHUB_OUTPUT
 
@@ -65,9 +65,9 @@ jobs:
       id: build
       run: |
         target="${{ matrix.target }}"
-        cargo build --release --target "$target"
+        cargo build --profile release-opt --target "$target"
         name="${{ env.BINARY_NAME }}-${target%%-*}-macos"
-        cp "target/${target}/release/${{ env.BINARY_NAME }}" "$name"
+        cp "target/${target}/release-opt/${{ env.BINARY_NAME }}" "$name"
         gzip -9 "$name"
         echo "asset_name=$name.gz" >> $GITHUB_OUTPUT
 
