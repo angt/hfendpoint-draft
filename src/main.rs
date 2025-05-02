@@ -20,7 +20,7 @@ use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     convert::TryFrom,
     io::Cursor,
     num::ParseIntError,
@@ -314,8 +314,8 @@ struct WorkerMessage<T> {
 
 struct Worker {
     id: u64,
-    rx: mpsc::Receiver<Vec<u8>>,
-    subs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    rx: mpsc::Receiver<Bytes>,
+    subs: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
     start_time: Instant,
 }
 
@@ -352,7 +352,7 @@ impl Drop for Worker {
         let id = self.id;
         let start_time = self.start_time;
         tokio::spawn(async move {
-            if subs.lock().await.remove(&id).is_some() {
+            if subs.remove(&id).is_some() {
                 let duration = start_time.elapsed();
                 info!(
                     request_id = id,
@@ -403,7 +403,7 @@ impl ImageStore {
 
 struct AppState {
     writer: Mutex<Option<OwnedWriteHalf>>,
-    subs: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    subs: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
     id_counter: AtomicU64,
     image_store: ImageStore,
 }
@@ -437,8 +437,8 @@ impl AppState {
         }
         info!(request_id = id, handler_name = name, "Request worker");
 
-        let (tx, rx) = mpsc::channel(buffer_size);
-        self.subs.lock().await.insert(id, tx);
+        let (tx, rx) = mpsc::channel::<Bytes>(buffer_size);
+        self.subs.insert(id, tx);
 
         Ok(Worker {
             id,
@@ -796,7 +796,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         writer: Mutex::new(Some(write_request)),
-        subs: Arc::new(Mutex::new(HashMap::new())),
+        subs: Arc::new(DashMap::new()),
         id_counter: AtomicU64::new(1),
         image_store: ImageStore::new(args.max_image_capacity),
     });
@@ -821,8 +821,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rmp_serde::from_read::<_, WorkerMessage<rmpv::Value>>(&mut cursor)
                 {
                     let pos = cursor.position() as usize;
-                    let raw = buf[consumed..pos].to_vec();
-                    if let Some(sender) = subs.lock().await.get(&msg.id) {
+                    let raw = Bytes::copy_from_slice(&buf[consumed..pos]);
+                    if let Some(sender) = subs.get(&msg.id) {
                         let _ = sender.send(raw).await;
                     } else {
                         warn!(
