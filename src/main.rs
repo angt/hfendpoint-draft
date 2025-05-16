@@ -386,21 +386,37 @@ impl ImageStore {
 
     async fn insert(&self, id: String, image: Bytes) {
         let size = image.len();
+
         self.data.insert(id.clone(), image);
         self.current_size.fetch_add(size, Ordering::Relaxed);
 
         let mut queue = self.queue.lock().await;
         queue.push_back(id);
 
-        let mut current = self.current_size.load(Ordering::Relaxed);
-        while current > self.max_capacity {
+        while self.current_size.load(Ordering::Relaxed) > self.max_capacity {
             if let Some(old_id) = queue.pop_front() {
                 if let Some((_, old_img)) = self.data.remove(&old_id) {
-                    current = current.saturating_sub(old_img.len());
+                    self.current_size.fetch_sub(old_img.len(), Ordering::Relaxed);
                 }
+            } else {
+                break;
             }
         }
-        self.current_size.store(current, Ordering::Relaxed);
+    }
+
+    async fn delete(&self, id: &str) -> bool {
+        let mut found = false;
+
+        if let Some((_, bytes)) = self.data.remove(id) {
+            self.current_size.fetch_sub(bytes.len(), Ordering::Relaxed);
+            found = true;
+        }
+        let mut queue = self.queue.lock().await;
+
+        if let Some(pos) = queue.iter().position(|x| x == id) {
+            queue.remove(pos);
+        }
+        found
     }
 }
 
@@ -500,7 +516,7 @@ async fn process_image_response(
         },
         ImageResponseFormat::Url => {
             let id = format!("{}-{}", worker_id, image_id);
-            let url = format!("{}/images/{}", base_url(headers), id);
+            let url = format!("{}/v1/images/{}", base_url(headers), id);
             state.image_store.insert(id, image_bytes).await;
             ImageData {
                 url: Some(url),
@@ -622,21 +638,29 @@ async fn images_editions(
     }))
 }
 
-async fn images(
+async fn delete_images(
     State(state): State<Arc<AppState>>,
-    Path(image_id): Path<String>,
-) -> Result<Response, StatusCode> {
-    match state.image_store.data.get(&image_id) {
-        Some(image_data_ref) => {
-            let bytes = image_data_ref.value().clone();
-            Ok((
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "image/png")],
-                bytes,
-            )
-                .into_response())
-        }
-        None => Err(StatusCode::NOT_FOUND),
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.image_store.delete(&id).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+async fn get_images(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(image) = state.image_store.data.get(&id) {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(image.value().clone().into())
+            .unwrap()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -858,11 +882,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
-        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/images/{image_id}", get(get_images).delete(delete_images))
         .route("/v1/embeddings", post(embeddings))
-        .route("/images/{image_id}", get(images))
         .with_state(state.clone());
 
     let bind = format!("{}:{}", args.host, args.port);
