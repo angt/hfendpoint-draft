@@ -13,16 +13,19 @@ use axum::{
 };
 use axum_typed_multipart::{TryFromMultipart, TypedMultipart};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::BytesMut;
 use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use rmp_serde::decode::Error as RmpDecodeError;
+use rmp_serde::encode::Error as RmpEncodeError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     convert::TryFrom,
-    io::Cursor,
+    io::{Cursor, ErrorKind},
     num::ParseIntError,
     os::unix::io::AsRawFd,
     process::Stdio,
@@ -66,9 +69,9 @@ struct Args {
 #[derive(Error, Debug)]
 enum ApiError {
     #[error("Serialization failed: {0}")]
-    Serialization(#[from] rmp_serde::encode::Error),
+    Serialization(#[from] RmpEncodeError),
     #[error("Deserialization failed: {0}")]
-    Deserialization(#[from] rmp_serde::decode::Error),
+    Deserialization(#[from] RmpDecodeError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Channel closed")]
@@ -803,35 +806,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn({
         let subs = state.subs.clone();
         async move {
-            let mut reader = BufReader::new(read_reply);
-            let mut buf = Vec::with_capacity(8192);
-            let mut chunk = vec![0; 4096];
-            while let Ok(n) = reader.read(&mut chunk).await {
+            let mut reader = BufReader::with_capacity(8192, read_reply);
+            let mut buf = BytesMut::with_capacity(2 * 8192);
+            while let Ok(n) = reader.read_buf(&mut buf).await {
                 if n == 0 {
                     info!("Worker reply pipe closed (EOF). Reader task exiting.");
                     let _ = worker_tx.send(());
                     break;
                 }
-                buf.extend_from_slice(&chunk[..n]);
-                let mut cursor = Cursor::new(&buf);
-                let mut consumed = 0;
-                while let Ok(msg) =
-                    rmp_serde::from_read::<_, WorkerMessage<rmpv::Value>>(&mut cursor)
-                {
-                    let pos = cursor.position() as usize;
-                    let raw = Bytes::copy_from_slice(&buf[consumed..pos]);
-                    if let Some(sender) = subs.get(&msg.id) {
-                        let _ = sender.send(raw).await;
-                    } else {
-                        warn!(
-                            request_id = msg.id,
-                            "Subscription not found for received message."
-                        );
+                while !buf.is_empty() {
+                    let mut cursor = Cursor::new(buf.as_ref());
+                    match rmp_serde::from_read::<_, WorkerMessage<rmpv::Value>>(&mut cursor) {
+                        Ok(msg) => {
+                            let pos = cursor.position() as usize;
+                            let raw: Bytes = buf.split_to(pos).freeze();
+                            if let Some(sender) = subs.get(&msg.id) {
+                                let _ = sender.send(raw).await;
+                            } else {
+                                warn!(
+                                    request_id = msg.id,
+                                    "Subscription not found for received message."
+                                );
+                            }
+                        }
+                        Err(RmpDecodeError::InvalidDataRead(ref io_err))
+                        | Err(RmpDecodeError::InvalidMarkerRead(ref io_err))
+                            if io_err.kind() == ErrorKind::UnexpectedEof =>
+                        {
+                            break
+                        }
+                        Err(e) => {
+                            error!("Deserialization error: {:?}. Clearing buffer.", e);
+                            buf.clear();
+                            break;
+                        }
                     }
-                    consumed = pos;
-                }
-                if consumed > 0 {
-                    buf.drain(..consumed);
                 }
             }
         }
