@@ -457,8 +457,7 @@ fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
 
 #[derive(Deserialize)]
 struct Png {
-    #[serde(with = "serde_bytes")]
-    png: Vec<u8>,
+    png: Bytes,
 }
 
 #[derive(Copy, Clone)]
@@ -584,18 +583,17 @@ async fn images_editions(
         n: u32,
         width: u32,
         height: u32,
-        #[serde(with = "serde_bytes")]
-        image: Vec<u8>,
-        #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none")]
-        mask: Option<Vec<u8>>,
+        image: Bytes,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mask: Option<Bytes>,
     }
     let request = WorkerRequest {
         prompt: payload.prompt,
         n,
         width,
         height,
-        image: payload.image.to_vec(),
-        mask: payload.mask.map(|b| b.to_vec()),
+        image: payload.image,
+        mask: payload.mask,
     };
     let mut worker = state.call("images_editions", request, n as _).await?;
     let mut data = Vec::with_capacity(n as usize);

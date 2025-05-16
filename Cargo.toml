@@ -21,6 +21,7 @@ nix = { version = "0.29", features = ["fs"] }
 base64 = "0.22"
 dashmap = "6.1"
 axum_typed_multipart = "0.15"
+bytes = { version = "1", features = ["serde"] }
 
 [profile.release-opt]
 inherits = "release"
