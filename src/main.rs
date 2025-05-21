@@ -66,113 +66,103 @@ struct Args {
     max_image_capacity: usize,
 }
 
+#[derive(Serialize)]
+struct ApiErrorDetail {
+    message: String,
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ApiErrorResponse {
+    error: ApiErrorDetail,
+}
+
 #[derive(Error, Debug)]
 enum ApiError {
-    #[error("Serialization failed: {0}")]
-    Serialization(#[from] RmpEncodeError),
-    #[error("Deserialization failed: {0}")]
-    Deserialization(#[from] RmpDecodeError),
+    #[error("Rmp encode error: {0}")]
+    RmpEncode(#[from] RmpEncodeError),
+    #[error("Rmp decode error: {0}")]
+    RmpDecode(#[from] RmpDecodeError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Channel closed")]
     ChannelClosed,
-    #[error("JSON serialization failed: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Invalid size format: {0}")]
-    InvalidSizeFormat(String),
     #[error("Multipart error: {0}")]
     Multipart(#[from] MultipartError),
-    #[error("Invalid integer field: {0}")]
-    InvalidIntField(#[from] ParseIntError),
-    #[error("Invalid value '{value}' for parameter '{param}'")]
-    InvalidParameterValue { param: String, value: String },
-    #[error("Worker cannot accept new requests.")]
-    WorkerUnavailable,
-    #[error("Failed to install signal handler: {0}")]
-    SignalSetup(std::io::Error),
+    #[error("Invalid parameter value for '{param}': {msg}")]
+    InvalidParameterValue { param: &'static str, msg: String },
+    #[error("Worker cannot accept new requests")]
+    ServiceUnavailable,
     #[error("Worker process failed: {0}")]
-    WorkerError(String),
-    #[error("Internal server error: {0}")]
     InternalServerError(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, openai_error_type, param, message) = match &self {
-            ApiError::InvalidSizeFormat(val) => (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                Some("size"),
-                format!(
-                    "Invalid value for 'size'. Expected format like '1024x1024', got: '{}'",
-                    val
-                ),
-            ),
+        let (status, r#type, param, message) = match &self {
             ApiError::Multipart(e) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 None,
                 format!("Invalid multipart/form-data request: {}", e),
             ),
-            ApiError::InvalidIntField(e) => (
+            ApiError::InvalidParameterValue { param, msg } => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                None,
-                format!("Invalid integer value provided in a request field: {}", e),
+                Some(*param),
+                msg.clone(),
             ),
-            ApiError::InvalidParameterValue { param, value } => (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                Some(param.as_str()),
-                format!("Invalid value '{value}' for parameter '{param}'"),
-            ),
-            ApiError::WorkerUnavailable => (
+            ApiError::ServiceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",
                 None,
-                "Please try again later.".to_string(),
-            ),
-            ApiError::WorkerError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                None,
-                format!("Worker error: {}", msg),
+                "The engine is currently overloaded, please try again later".to_string(),
             ),
             ApiError::InternalServerError(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
                 None,
-                msg.clone(),
+                msg.to_string(),
             ),
-            _ => {
-                error!(error.message = %self, error.type = "api_error", "Internal Server Error occurred");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    None,
-                    "An unexpected internal server error occurred.".to_string(),
-                )
-            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                None,
+                "The server had an error while processing your request".to_string(),
+            )
         };
         if status.is_server_error() {
-            error!(error.message = %self, error.type = openai_error_type, param = ?param, "Server/Worker error occurred");
+            error!(
+                status = %status,
+                r#type = r#type,
+                param = ?param,
+                message = message,
+                %self,
+            );
         } else if status.is_client_error() {
-            info!(error.message = %self, error.type = openai_error_type, param = ?param, "Client error occurred");
-        }
-        let mut error_payload = serde_json::json!({
-            "message": message,
-            "type": openai_error_type,
-            "param": serde_json::Value::Null,
-            "code": serde_json::Value::Null,
-        });
-        if let Some(p) = param {
-            error_payload.as_object_mut().unwrap().insert(
-                "param".to_string(),
-                serde_json::Value::String(p.to_string()),
+            info!(
+                status = %status,
+                r#type = r#type,
+                param = ?param,
+                message = message,
+                %self,
             );
         }
-        let body = Json(serde_json::json!({ "error": error_payload }));
-        (status, body).into_response()
+        let response = ApiErrorResponse {
+            error: ApiErrorDetail {
+                message,
+                r#type,
+                param,
+                code: None,
+            },
+        };
+        (status, Json(response)).into_response()
     }
 }
 
@@ -277,14 +267,14 @@ struct ChatResponse {
 enum EmbeddingInput {
     String(String),
     StringArray(Vec<String>),
+    Tokens(Vec<u32>),
+    TokenArray(Vec<Vec<u32>>),
 }
 
 #[derive(Deserialize, Debug)]
 struct EmbeddingRequest {
     input: EmbeddingInput,
-    model: String,
     encoding_format: Option<String>,
-    dimensions: Option<u32>,
 }
 
 #[derive(Serialize, Debug)]
@@ -325,25 +315,19 @@ struct Worker {
 impl Worker {
     async fn next<T: DeserializeOwned>(&mut self) -> Result<T, ApiError> {
         let raw = self.rx.recv().await.ok_or(ApiError::ChannelClosed)?;
-        let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw).map_err(|e| {
-            error!("Failed to deserialize worker message: {}", e);
-            ApiError::Deserialization(e)
-        })?;
-        if let Some(err_msg) = msg.error {
-            warn!(request_id = msg.id, "Worker reported error: {}", err_msg);
-            return Err(ApiError::WorkerError(err_msg));
-        }
+        let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw)?;
         match msg.data {
             Some(data) => Ok(data),
             None => {
                 error!(
                     request_id = msg.id,
-                    "Worker sent null data without an explicit error for type {}",
+                    "Worker sent null data for type {}",
                     std::any::type_name::<T>()
                 );
-                Err(ApiError::InternalServerError(
-                    "Worker returned no data and no error".to_string(),
-                ))
+                let err_msg = msg.error.unwrap_or_else(||
+                    "The worker process encountered an unspecified error".to_string()
+                );
+                Err(ApiError::InternalServerError(err_msg))
             }
         }
     }
@@ -451,7 +435,7 @@ impl AppState {
         let start_time = Instant::now();
         {
             let mut writer_guard = self.writer.lock().await;
-            let sender = writer_guard.as_mut().ok_or(ApiError::WorkerUnavailable)?;
+            let sender = writer_guard.as_mut().ok_or(ApiError::ServiceUnavailable)?;
             sender.write_all(&raw).await?;
         }
         info!(request_id = id, handler_name = name, "Request worker");
@@ -471,7 +455,10 @@ impl AppState {
 fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
     size.split_once('x')
         .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
-        .ok_or(ApiError::InvalidSizeFormat(size.to_string()))
+        .ok_or(ApiError::InvalidParameterValue {
+            param: "size",
+            msg: size.to_string(),
+        })
 }
 
 #[derive(Deserialize)]
@@ -493,9 +480,9 @@ impl TryFrom<Option<String>> for ImageResponseFormat {
         match format.as_str() {
             "url" => Ok(ImageResponseFormat::Url),
             "b64_json" => Ok(ImageResponseFormat::B64Json),
-            bad => Err(ApiError::InvalidParameterValue {
-                param: "response_format".to_string(),
-                value: bad.to_string(),
+            _ => Err(ApiError::InvalidParameterValue {
+                param: "response_format",
+                msg: format!("Response format {} not supported", format),
             }),
         }
     }
@@ -591,7 +578,11 @@ async fn images_editions(
     let n = payload
         .n
         .map(|s| s.parse::<u32>())
-        .transpose()?
+        .transpose()
+        .map_err(|e: ParseIntError| ApiError::InvalidParameterValue {
+            param: "n",
+            msg: format!("Failed to parse integer: {}", e),
+        })?
         .unwrap_or(1);
     let response_format = ImageResponseFormat::try_from(payload.response_format)?;
     let (width, height) = parse_size(&payload.size.unwrap_or("1024x1024".into()))?;
@@ -685,7 +676,7 @@ async fn chat_completions(
                             model: None,
                             choices: vec![ChatChoice::Delta(chunk)],
                         };
-                        let json = serde_json::to_string(&resp).map_err(ApiError::Json)?;
+                        let json = serde_json::to_string(&resp)?;
                         yield Ok(Event::default().data(json));
                         if is_final {
                             break;
@@ -725,6 +716,40 @@ async fn chat_completions(
     }
 }
 
+async fn tokenize(
+    state: &Arc<AppState>,
+    input: Vec<String>,
+) -> Result<Vec<Vec<u32>>, ApiError> {
+    if input.is_empty() {
+        return Err(ApiError::InvalidParameterValue {
+            param: "input",
+            msg: "Input string array must not be empty".to_string(),
+        });
+    }
+    if let Some(idx) = input.iter().position(|s_item| s_item.is_empty()) {
+        return Err(ApiError::InvalidParameterValue {
+            param: "input",
+            msg: format!("Input string at index {} must not be empty", idx),
+        });
+    }
+    #[derive(Serialize)]
+    struct WorkerRequest {
+        input: Vec<String>,
+    }
+    let request = WorkerRequest {
+        input,
+    };
+    let mut worker = state.call("tokenize", request, 1).await?;
+
+    #[derive(Deserialize, Debug)]
+    struct WorkerResponse {
+        tokens: Vec<Vec<u32>>,
+    }
+    let response: WorkerResponse = worker.next().await?;
+
+    Ok(response.tokens)
+}
+
 async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<EmbeddingRequest>,
@@ -732,32 +757,33 @@ async fn embeddings(
     let encoding_format = payload.encoding_format.unwrap_or("float".to_string());
     if encoding_format != "float" {
         return Err(ApiError::InvalidParameterValue {
-            param: "encoding_format".to_string(),
-            value: encoding_format,
+            param: "encoding_format",
+            msg: format!("Encoding format {} is not supported", encoding_format),
         });
     }
     let input = match payload.input {
-        EmbeddingInput::String(s) => vec![s],
-        EmbeddingInput::StringArray(arr) => arr,
+        EmbeddingInput::String(x) => tokenize(&state, vec![x]).await?,
+        EmbeddingInput::StringArray(x) => tokenize(&state, x).await?,
+        EmbeddingInput::Tokens(x) => vec![x],
+        EmbeddingInput::TokenArray(x) => x,
     };
+    let total_tokens: u32 = input
+        .iter()
+        .map(|v| v.len())
+        .sum::<usize>() as u32;
 
     #[derive(Serialize)]
     struct WorkerRequest {
-        input: Vec<String>,
-        model: String,
-        dimensions: Option<u32>,
+        input: Vec<Vec<u32>>,
     }
     let request = WorkerRequest {
         input,
-        model: payload.model.clone(),
-        dimensions: payload.dimensions,
     };
     let mut worker = state.call("embeddings", request, 1).await?;
 
     #[derive(Deserialize, Debug)]
     struct WorkerResponse {
         embeddings: Vec<Vec<f32>>,
-        usage: UsageStats,
         model: String,
     }
     let response: WorkerResponse = worker.next().await?;
@@ -777,7 +803,10 @@ async fn embeddings(
         object: "list".to_string(),
         data,
         model: response.model,
-        usage: response.usage,
+        usage: UsageStats {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
     };
     Ok(Json(api_response))
 }
@@ -885,7 +914,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
-        .route("/v1/images/{image_id}", get(get_images).delete(delete_images))
+        .route("/v1/images/{id}", get(get_images).delete(delete_images))
         .route("/v1/embeddings", post(embeddings))
         .with_state(state.clone());
 
@@ -897,8 +926,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = {
         let state = state.clone();
 
-        let mut sigint = signal(SignalKind::interrupt()).map_err(ApiError::SignalSetup)?;
-        let mut sigterm = signal(SignalKind::terminate()).map_err(ApiError::SignalSetup)?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
 
         async move {
             tokio::select! {
