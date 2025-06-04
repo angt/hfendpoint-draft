@@ -18,6 +18,7 @@ use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::sys::socket::{setsockopt, sockopt};
 use rmp_serde::decode::Error as RmpDecodeError;
 use rmp_serde::encode::Error as RmpEncodeError;
 use serde::de::DeserializeOwned;
@@ -135,7 +136,7 @@ impl IntoResponse for ApiError {
                 "api_error",
                 None,
                 "The server had an error while processing your request".to_string(),
-            )
+            ),
         };
         if status.is_server_error() {
             error!(
@@ -324,9 +325,9 @@ impl Worker {
                     "Worker sent null data for type {}",
                     std::any::type_name::<T>()
                 );
-                let err_msg = msg.error.unwrap_or_else(||
+                let err_msg = msg.error.unwrap_or_else(|| {
                     "The worker process encountered an unspecified error".to_string()
-                );
+                });
                 Err(ApiError::InternalServerError(err_msg))
             }
         }
@@ -380,7 +381,8 @@ impl ImageStore {
         while self.current_size.load(Ordering::Relaxed) > self.max_capacity {
             if let Some(old_id) = queue.pop_front() {
                 if let Some((_, old_img)) = self.data.remove(&old_id) {
-                    self.current_size.fetch_sub(old_img.len(), Ordering::Relaxed);
+                    self.current_size
+                        .fetch_sub(old_img.len(), Ordering::Relaxed);
                 }
             } else {
                 break;
@@ -716,10 +718,7 @@ async fn chat_completions(
     }
 }
 
-async fn tokenize(
-    state: &Arc<AppState>,
-    input: Vec<String>,
-) -> Result<Vec<Vec<u32>>, ApiError> {
+async fn tokenize(state: &Arc<AppState>, input: Vec<String>) -> Result<Vec<Vec<u32>>, ApiError> {
     if input.is_empty() {
         return Err(ApiError::InvalidParameterValue {
             param: "input",
@@ -736,9 +735,7 @@ async fn tokenize(
     struct WorkerRequest {
         input: Vec<String>,
     }
-    let request = WorkerRequest {
-        input,
-    };
+    let request = WorkerRequest { input };
     let mut worker = state.call("tokenize", request, 1).await?;
 
     #[derive(Deserialize, Debug)]
@@ -767,24 +764,18 @@ async fn embeddings(
         EmbeddingInput::Tokens(x) => vec![x],
         EmbeddingInput::TokenArray(x) => x,
     };
-    let total_tokens: u32 = input
-        .iter()
-        .map(|v| v.len())
-        .sum::<usize>() as u32;
+    let total_tokens: u32 = input.iter().map(|v| v.len()).sum::<usize>() as u32;
 
     #[derive(Serialize)]
     struct WorkerRequest {
         input: Vec<Vec<u32>>,
     }
-    let request = WorkerRequest {
-        input,
-    };
+    let request = WorkerRequest { input };
     let mut worker = state.call("embeddings", request, 1).await?;
 
     #[derive(Deserialize, Debug)]
     struct WorkerResponse {
         embeddings: Vec<Vec<f32>>,
-        model: String,
     }
     let response: WorkerResponse = worker.next().await?;
 
@@ -802,7 +793,7 @@ async fn embeddings(
     let api_response = EmbeddingResponse {
         object: "list".to_string(),
         data,
-        model: response.model,
+        model: "unknown".to_string(),
         usage: UsageStats {
             prompt_tokens: total_tokens,
             total_tokens,
@@ -811,12 +802,22 @@ async fn embeddings(
     Ok(Json(api_response))
 }
 
-fn raw_fd_no_cloexec(stream: &UnixStream) -> nix::Result<i32> {
-    let fd = stream.as_raw_fd();
-    let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
-    let new_flags = flags.difference(FdFlag::FD_CLOEXEC);
-    fcntl(fd, FcntlArg::F_SETFD(new_flags))?;
-    Ok(fd)
+fn socketpair(buffer_size: usize) -> Result<(UnixStream, UnixStream), Box<dyn std::error::Error>> {
+    let (server, worker) = UnixStream::pair()?;
+
+    setsockopt(&server, sockopt::SndBuf, &buffer_size)?;
+    setsockopt(&server, sockopt::RcvBuf, &buffer_size)?;
+
+    setsockopt(&worker, sockopt::SndBuf, &buffer_size)?;
+    setsockopt(&worker, sockopt::RcvBuf, &buffer_size)?;
+
+    let mut flags =
+        FdFlag::from_bits(fcntl(&worker, FcntlArg::F_GETFD)?).ok_or(nix::errno::Errno::EINVAL)?;
+
+    flags.remove(FdFlag::FD_CLOEXEC);
+    fcntl(&worker, FcntlArg::F_SETFD(flags))?;
+
+    Ok((server, worker))
 }
 
 #[tokio::main]
@@ -832,12 +833,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let (sock, worker_sock) = UnixStream::pair()?;
-    let worker_fd = raw_fd_no_cloexec(&worker_sock)?;
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    let (sock, worker_sock) = socketpair(BUFFER_SIZE)?;
 
     let mut child = Command::new(&args.worker_path)
         .args(&args.worker_args)
-        .env("HFENDPOINT_FD", worker_fd.to_string())
+        .env("HFENDPOINT_FD", worker_sock.as_raw_fd().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -859,8 +860,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn({
         let subs = state.subs.clone();
         async move {
-            let mut reader = BufReader::with_capacity(8192, read_reply);
-            let mut buf = BytesMut::with_capacity(2 * 8192);
+            let mut reader = BufReader::with_capacity(BUFFER_SIZE, read_reply);
+            let mut buf = BytesMut::with_capacity(2 * BUFFER_SIZE);
             while let Ok(n) = reader.read_buf(&mut buf).await {
                 if n == 0 {
                     info!("Worker reply pipe closed (EOF). Reader task exiting.");

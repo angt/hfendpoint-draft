@@ -9,6 +9,7 @@ def run(handler):
     fd = int(os.environ["HFENDPOINT_FD"])
     unpacker = msgpack.Unpacker()
     reply_buffer = bytearray()
+    reply_buffer_offset = 0
 
     def send_chunk(request_id, chunk):
         nonlocal reply_buffer
@@ -26,7 +27,7 @@ def run(handler):
 
     try:
         while True:
-            write_fds = [fd] if reply_buffer else []
+            write_fds = [fd] if len(reply_buffer) > reply_buffer_offset else []
 
             if not read_fds and not write_fds:
                 break
@@ -62,10 +63,14 @@ def run(handler):
                     except Exception as e:
                         print(f"Error processing request {request_id}: {e}")
 
-            if fd in writable and reply_buffer:
-                written = os.write(fd, reply_buffer)
+            if fd in writable:
+                data_to_send = memoryview(reply_buffer)[reply_buffer_offset:]
+                written = os.write(fd, data_to_send)
                 if written > 0:
-                    del reply_buffer[:written]
+                    reply_buffer_offset += written
+                if reply_buffer_offset == len(reply_buffer):
+                    reply_buffer = bytearray()
+                    reply_buffer_offset = 0
 
     except Exception as e:
         print(f"Worker error: {e}")
