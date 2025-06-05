@@ -455,23 +455,37 @@ impl AppState {
             data,
         };
         let raw = rmp_serde::to_vec_named(&request)?;
-        let start_time = Instant::now();
-        {
-            let mut writer_guard = self.writer.lock().await;
-            let sender = writer_guard.as_mut().ok_or(ApiError::ServiceUnavailable)?;
-            sender.write_all(&raw).await?;
-        }
-        info!(request_id = id, handler_name = name, "Request worker");
+
+        let mut writer_guard = self.writer.lock().await;
+        let sender = writer_guard.as_mut().ok_or(ApiError::ServiceUnavailable)?;
 
         let (tx, rx) = mpsc::channel::<Bytes>(buffer_size);
         self.subs.insert(id, tx);
 
-        Ok(Worker {
-            id,
-            rx,
-            subs: self.subs.clone(),
-            start_time,
-        })
+        let start_time = Instant::now();
+        let sender_return = sender.write_all(&raw).await;
+        let _ = sender;
+
+        match sender_return {
+            Ok(_) => {
+                info!(request_id = id, handler_name = name, "Request worker");
+                Ok(Worker {
+                    id,
+                    rx,
+                    subs: self.subs.clone(),
+                    start_time,
+                })
+            }
+            Err(e) => {
+                self.subs.remove(&id);
+                error!(
+                    request_id = id,
+                    handler_name = name,
+                    "IPC write to worker failed: {}. Subscription removed.", e
+                );
+                Err(ApiError::ServiceUnavailable)
+            }
+        }
     }
 }
 
