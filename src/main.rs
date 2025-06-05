@@ -63,8 +63,29 @@ struct Args {
     worker_args: Vec<String>,
 
     /// Maximum memory capacity for images in bytes
-    #[clap(long, default_value = "1073741824")]
+    #[clap(long, default_value = "1G", value_parser = parse_size)]
     max_image_capacity: usize,
+}
+
+fn parse_size(input: &str) -> Result<usize, String> {
+    let input = input.trim();
+    let (value, suffix) = input.chars().partition::<String, _>(|c| c.is_ascii_digit());
+
+    let multiplier: usize = match suffix.to_ascii_uppercase().as_str() {
+        "" => 1,
+        "K" => 1024,
+        "M" => 1024 * 1024,
+        "G" => 1024 * 1024 * 1024,
+        _ => return Err(format!("Invalid suffix: '{}'", suffix)),
+    };
+    let number = value
+        .parse::<usize>()
+        .map_err(|e| format!("Invalid number: {}", e))?;
+
+    if number == 0 {
+        return Err("Value must be strictly positive".into());
+    }
+    Ok(number * multiplier)
 }
 
 #[derive(Serialize)]
@@ -454,7 +475,7 @@ impl AppState {
     }
 }
 
-fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
+fn parse_wxh(size: &str) -> Result<(u32, u32), ApiError> {
     size.split_once('x')
         .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
         .ok_or(ApiError::InvalidParameterValue {
@@ -522,7 +543,7 @@ async fn images_generations(
 ) -> Result<Json<ImagesResponse>, ApiError> {
     let n = payload.n.unwrap_or(1);
     let response_format = ImageResponseFormat::try_from(payload.response_format)?;
-    let (width, height) = parse_size(&payload.size.unwrap_or("1024x1024".into()))?;
+    let (width, height) = parse_wxh(&payload.size.unwrap_or("1024x1024".into()))?;
 
     #[derive(Serialize)]
     struct WorkerRequest {
@@ -587,7 +608,7 @@ async fn images_editions(
         })?
         .unwrap_or(1);
     let response_format = ImageResponseFormat::try_from(payload.response_format)?;
-    let (width, height) = parse_size(&payload.size.unwrap_or("1024x1024".into()))?;
+    let (width, height) = parse_wxh(&payload.size.unwrap_or("1024x1024".into()))?;
 
     #[derive(Serialize)]
     struct WorkerRequest {
