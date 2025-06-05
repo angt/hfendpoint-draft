@@ -66,10 +66,11 @@ def run(handler):
             if fd in writable:
                 data_to_send = memoryview(reply_buffer)[reply_buffer_offset:]
                 written = os.write(fd, data_to_send)
+                del data_to_send
                 if written > 0:
                     reply_buffer_offset += written
                 if reply_buffer_offset == len(reply_buffer):
-                    reply_buffer = bytearray()
+                    del reply_buffer[:]
                     reply_buffer_offset = 0
 
     except Exception as e:
