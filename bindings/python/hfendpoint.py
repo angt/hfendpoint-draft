@@ -35,7 +35,7 @@ def run(handler):
             readable, writable, _ = select.select(read_fds, write_fds, [])
 
             if fd in readable:
-                data = os.read(fd, 4096)
+                data = os.read(fd, 1024*1024)
                 if not data:
                     read_fds = []
                     continue
