@@ -799,6 +799,18 @@ async fn embeddings(
         EmbeddingInput::Tokens(x) => vec![x],
         EmbeddingInput::TokenArray(x) => x,
     };
+    if input.is_empty() {
+        return Err(ApiError::InvalidParameterValue {
+            param: "input",
+            msg: "Input array must not be empty".to_string(),
+        });
+    }
+    if let Some(idx) = input.iter().position(|v| v.is_empty()) {
+        return Err(ApiError::InvalidParameterValue {
+            param: "input",
+            msg: format!("Input array at index {} must not be empty", idx),
+        });
+    }
     let total_tokens: u32 = input.iter().map(|v| v.len()).sum::<usize>() as u32;
 
     #[derive(Serialize)]
