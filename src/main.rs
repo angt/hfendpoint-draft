@@ -42,8 +42,8 @@ use tokio::{
     signal::unix::{signal, SignalKind},
     sync::{mpsc, oneshot, Mutex},
 };
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[clap(version, about, long_about = None)]
@@ -481,7 +481,7 @@ impl AppState {
                 error!(
                     request_id = id,
                     handler_name = name,
-                    "IPC write to worker failed: {}. Subscription removed.", e
+                    "IPC write to worker failed: {}", e
                 );
                 Err(ApiError::ServiceUnavailable)
             }
@@ -869,14 +869,14 @@ fn socketpair(buffer_size: usize) -> Result<(UnixStream, UnixStream), Box<dyn st
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
         .with_target(false)
         .compact()
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Setting default tracing subscriber failed");
+        .init();
 
     let args = Args::parse();
 
@@ -937,7 +937,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break
                         }
                         Err(e) => {
-                            error!("Deserialization error: {:?}. Clearing buffer.", e);
+                            error!("Deserialization error: {:?}", e);
                             buf.clear();
                             break;
                         }
