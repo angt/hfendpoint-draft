@@ -1,6 +1,7 @@
 use axum::{
     body::Bytes,
     extract::multipart::MultipartError,
+    extract::DefaultBodyLimit,
     extract::Path,
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -32,7 +33,7 @@ use std::{
     process::Stdio,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -65,6 +66,10 @@ struct Args {
     /// Maximum memory capacity for images in bytes
     #[clap(long, default_value = "1G", value_parser = parse_size)]
     max_image_capacity: usize,
+
+    /// Maximum request body size
+    #[clap(long, default_value = "10M", value_parser = parse_size)]
+    max_body_size: usize,
 }
 
 fn parse_size(input: &str) -> Result<usize, String> {
@@ -336,8 +341,15 @@ struct Worker {
 
 impl Worker {
     async fn next<T: DeserializeOwned>(&mut self) -> Result<T, ApiError> {
-        let raw = self.rx.recv().await.ok_or(ApiError::ChannelClosed)?;
+        const TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+        let raw = tokio::time::timeout(TIMEOUT, self.rx.recv())
+            .await
+            .map_err(|_| ApiError::InternalServerError("Worker response timed out".into()))?
+            .ok_or(ApiError::ChannelClosed)?;
+
         let msg: WorkerMessage<T> = rmp_serde::from_slice(&raw)?;
+
         match msg.data {
             Some(data) => Ok(data),
             None => {
@@ -481,7 +493,8 @@ impl AppState {
                 error!(
                     request_id = id,
                     handler_name = name,
-                    "IPC write to worker failed: {}", e
+                    "IPC write to worker failed: {}",
+                    e
                 );
                 Err(ApiError::ServiceUnavailable)
             }
@@ -555,7 +568,7 @@ async fn images_generations(
     headers: HeaderMap,
     Json(payload): Json<ImagesGenerationsRequest>,
 ) -> Result<Json<ImagesResponse>, ApiError> {
-    let n = payload.n.unwrap_or(1);
+    let n = payload.n.unwrap_or(1).clamp(1, 4);
     let response_format = ImageResponseFormat::try_from(payload.response_format)?;
     let (width, height) = parse_wxh(&payload.size.unwrap_or("1024x1024".into()))?;
 
@@ -869,8 +882,7 @@ fn socketpair(buffer_size: usize) -> Result<(UnixStream, UnixStream), Box<dyn st
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -964,6 +976,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/images/edits", post(images_editions))
         .route("/v1/images/{id}", get(get_images).delete(delete_images))
         .route("/v1/embeddings", post(embeddings))
+        .layer(DefaultBodyLimit::max(args.max_body_size))
         .with_state(state.clone());
 
     let bind = format!("{}:{}", args.host, args.port);
