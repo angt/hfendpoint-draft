@@ -476,7 +476,7 @@ impl AppState {
 
         let start_time = Instant::now();
         let sender_return = sender.write_all(&raw).await;
-        let _ = sender;
+        drop(writer_guard);
 
         match sender_return {
             Ok(_) => {
