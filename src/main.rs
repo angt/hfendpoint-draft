@@ -369,19 +369,14 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let subs = self.subs.clone();
-        let id = self.id;
-        let start_time = self.start_time;
-        tokio::spawn(async move {
-            if subs.remove(&id).is_some() {
-                let duration = start_time.elapsed();
-                info!(
-                    request_id = id,
-                    duration_ms = duration.as_millis(),
-                    "Subscription removed."
-                );
-            };
-        });
+        if let Some(_) = self.subs.remove(&self.id) {
+            let duration = self.start_time.elapsed();
+            info!(
+                request_id = self.id,
+                duration_ms = duration.as_millis(),
+                "Subscription removed."
+            );
+        }
     }
 }
 
