@@ -52,6 +52,8 @@ such as `/usr/local/bin`, so you can run it from anywhere.
               Port to listen on [default: 3000]
           --max-image-capacity <MAX_IMAGE_CAPACITY>
               Maximum memory capacity for images in bytes [default: 1G]
+          --max-body-size <MAX_BODY_SIZE>
+              Maximum request body size [default: 10M]
       -h, --help
               Print help
       -V, --version
