@@ -928,13 +928,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(msg) => {
                             let pos = cursor.position() as usize;
                             let raw: Bytes = buf.split_to(pos).freeze();
-                            if let Some(sender) = subs.get(&msg.id) {
-                                let _ = sender.send(raw).await;
+                            if let Some(sender) = subs.get(&msg.id).map(|e| e.value().clone()) {
+                                let _ = sender.send(raw).await.map_err(|e| {
+                                    error!(request_id = msg.id, "Failed to send message: {:?}", e);
+                                });
                             } else {
-                                warn!(
-                                    request_id = msg.id,
-                                    "Subscription not found for received message."
-                                );
+                                warn!(request_id = msg.id, "Subscription not found");
                             }
                         }
                         Err(RmpDecodeError::InvalidDataRead(ref io_err))
