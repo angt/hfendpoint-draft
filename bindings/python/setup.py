@@ -10,7 +10,7 @@ from setuptools.command.develop import develop
 from setuptools.command.install_scripts import install_scripts
 
 NAME = "hfendpoint"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 URL = f"https://github.com/angt/hfendpoint-draft/releases/download/v{VERSION}"
 
 def get_binary_url():

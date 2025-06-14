@@ -26,7 +26,7 @@ Binaries are provided for Linux and macOS (`x86_64` and `aarch64`).
 
     OS=linux     # or macos
     ARCH=x86_64  # or aarch64
-    curl -sSf https://github.com/angt/hfendpoint-draft/releases/download/v0.2.0/hfendpoint-$ARCH-$OS.gz | gunzip > hfendpoint
+    curl -sSf https://github.com/angt/hfendpoint-draft/releases/download/v0.2.1/hfendpoint-$ARCH-$OS.gz | gunzip > hfendpoint
     chmod +x hfendpoint
 
 For convenience, you may want to move the `hfendpoint` binary to a directory included in your `PATH`,
