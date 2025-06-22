@@ -707,19 +707,38 @@ async fn chat_completions(
     let is_stream = payload.stream.unwrap_or(false);
     let mut worker = state.call("chat_completions", payload, 10).await?;
 
+    #[derive(Deserialize)]
+    struct WorkerResponse {
+        content: Option<String>,
+        finish_reason: Option<String>,
+    }
     if is_stream {
+        let mut is_first_chunk = true;
         let stream = async_stream::stream! {
             loop {
-                let delta: Result<ChatChoiceDelta, _> = worker.next().await;
-                match delta {
+                match worker.next::<WorkerResponse>().await {
                     Ok(chunk) => {
-                        let is_final = chunk.finish_reason.as_deref() == Some("stop");
+                        let is_final = chunk.finish_reason.is_some();
+                        let delta = ChatMessage {
+                            role: if is_first_chunk {
+                                Some("assistant".to_string())
+                            } else {
+                                None
+                            },
+                            content: chunk.content,
+                        };
+                        is_first_chunk = false;
                         let resp = ChatResponse {
                             id: format!("chatcmpl-{}", worker.id),
                             object: "chat.completion.chunk".into(),
                             created: Utc::now().timestamp(),
                             model: None,
-                            choices: vec![ChatChoice::Delta(chunk)],
+                            choices: vec![ChatChoice::Delta(ChatChoiceDelta {
+                                index: 0,
+                                delta,
+                                finish_reason: chunk.finish_reason.clone(),
+                                logprobs: None,
+                            })],
                         };
                         let json = serde_json::to_string(&resp)?;
                         yield Ok(Event::default().data(json));
@@ -738,12 +757,11 @@ async fn chat_completions(
             content: Some(String::new()),
         };
         let mut finish_reason = None;
-
-        while let Ok(delta) = worker.next::<ChatChoiceDelta>().await {
-            if let Some(content) = delta.delta.content {
+        while let Ok(chunk) = worker.next::<WorkerResponse>().await {
+            if let Some(content) = chunk.content {
                 message.content.as_mut().unwrap().push_str(&content);
             }
-            finish_reason = delta.finish_reason;
+            finish_reason = chunk.finish_reason;
         }
         Ok(Json(ChatResponse {
             id: format!("chatcmpl-{}", worker.id),
