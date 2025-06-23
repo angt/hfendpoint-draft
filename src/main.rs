@@ -18,6 +18,7 @@ use bytes::BytesMut;
 use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
+use futures::Stream;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{setsockopt, sockopt};
 use rmp_serde::decode::Error as RmpDecodeError;
@@ -30,6 +31,7 @@ use std::{
     io::{Cursor, ErrorKind},
     num::ParseIntError,
     os::unix::io::AsRawFd,
+    pin::Pin,
     process::Stdio,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
@@ -695,6 +697,75 @@ async fn get_images(
     }
 }
 
+#[derive(Deserialize)]
+struct WorkerChatResponse {
+    content: Option<String>,
+    finish_reason: Option<String>,
+}
+
+fn stream_chat(mut worker: Worker) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send>> {
+    Box::pin(async_stream::stream! {
+        let mut is_first_chunk = true;
+        loop {
+            match worker.next::<WorkerChatResponse>().await {
+                Ok(chunk) => {
+                    let is_final = chunk.finish_reason.is_some();
+                    let delta = ChatMessage {
+                        role: if is_first_chunk {
+                            Some("assistant".to_string())
+                        } else {
+                            None
+                        },
+                        content: chunk.content,
+                    };
+                    is_first_chunk = false;
+                    let resp = ChatResponse {
+                        id: format!("chatcmpl-{}", worker.id),
+                        object: "chat.completion.chunk".into(),
+                        created: Utc::now().timestamp(),
+                        model: None,
+                        choices: vec![ChatChoice::Delta(ChatChoiceDelta {
+                            index: 0,
+                            delta,
+                            finish_reason: chunk.finish_reason.clone(),
+                            logprobs: None,
+                        })],
+                    };
+                    match serde_json::to_string(&resp) {
+                        Ok(json) => {
+                            yield Ok(Event::default().data(json));
+                        }
+                        Err(e) => {
+                            let api_err = ApiError::Json(e);
+                            error!(error = %api_err, "SSE serialization error");
+                            break;
+                        }
+                    }
+                    if is_final {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Error during streaming response");
+
+                    let resp = ApiErrorResponse {
+                        error: ApiErrorDetail {
+                            message: "The server had an error while processing your stream.".to_string(),
+                            r#type: "api_error",
+                            param: None,
+                            code: None,
+                        },
+                    };
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        yield Ok(Event::default().event("error").data(json));
+                    }
+                    break;
+                }
+            }
+        }
+    })
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ChatRequest>,
@@ -702,50 +773,8 @@ async fn chat_completions(
     let is_stream = payload.stream.unwrap_or(false);
     let mut worker = state.call("chat_completions", payload, 10).await?;
 
-    #[derive(Deserialize)]
-    struct WorkerResponse {
-        content: Option<String>,
-        finish_reason: Option<String>,
-    }
     if is_stream {
-        let mut is_first_chunk = true;
-        let stream = async_stream::stream! {
-            loop {
-                match worker.next::<WorkerResponse>().await {
-                    Ok(chunk) => {
-                        let is_final = chunk.finish_reason.is_some();
-                        let delta = ChatMessage {
-                            role: if is_first_chunk {
-                                Some("assistant".to_string())
-                            } else {
-                                None
-                            },
-                            content: chunk.content,
-                        };
-                        is_first_chunk = false;
-                        let resp = ChatResponse {
-                            id: format!("chatcmpl-{}", worker.id),
-                            object: "chat.completion.chunk".into(),
-                            created: Utc::now().timestamp(),
-                            model: None,
-                            choices: vec![ChatChoice::Delta(ChatChoiceDelta {
-                                index: 0,
-                                delta,
-                                finish_reason: chunk.finish_reason.clone(),
-                                logprobs: None,
-                            })],
-                        };
-                        let json = serde_json::to_string(&resp)?;
-                        yield Ok(Event::default().data(json));
-                        if is_final {
-                            break;
-                        }
-                    }
-                    Err(e) => { yield Err(e); break; }
-                }
-            }
-        };
-        Ok(Sse::new(stream).into_response())
+        Ok(Sse::new(stream_chat(worker)).into_response())
     } else {
         let mut message = ChatMessage {
             role: Some("assistant".into()),
@@ -753,7 +782,7 @@ async fn chat_completions(
         };
         let finish_reason: Option<String>;
         loop {
-            match worker.next::<WorkerResponse>().await {
+            match worker.next::<WorkerChatResponse>().await {
                 Ok(chunk) => {
                     if let Some(content) = chunk.content {
                         message.content.as_mut().unwrap().push_str(&content);
