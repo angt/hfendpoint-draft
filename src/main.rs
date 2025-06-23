@@ -353,14 +353,9 @@ impl Worker {
         match msg.data {
             Some(data) => Ok(data),
             None => {
-                error!(
-                    request_id = msg.id,
-                    "Worker sent null data for type {}",
-                    std::any::type_name::<T>()
-                );
-                let err_msg = msg.error.unwrap_or_else(|| {
-                    "The worker process encountered an unspecified error".to_string()
-                });
+                let err_msg = msg
+                    .error
+                    .unwrap_or("Worker failed without providing error details".into());
                 Err(ApiError::InternalServerError(err_msg))
             }
         }
@@ -756,12 +751,22 @@ async fn chat_completions(
             role: Some("assistant".into()),
             content: Some(String::new()),
         };
-        let mut finish_reason = None;
-        while let Ok(chunk) = worker.next::<WorkerResponse>().await {
-            if let Some(content) = chunk.content {
-                message.content.as_mut().unwrap().push_str(&content);
+        let finish_reason: Option<String>;
+        loop {
+            match worker.next::<WorkerResponse>().await {
+                Ok(chunk) => {
+                    if let Some(content) = chunk.content {
+                        message.content.as_mut().unwrap().push_str(&content);
+                    }
+                    if chunk.finish_reason.is_some() {
+                        finish_reason = chunk.finish_reason;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(e);
+                }
             }
-            finish_reason = chunk.finish_reason;
         }
         Ok(Json(ChatResponse {
             id: format!("chatcmpl-{}", worker.id),
