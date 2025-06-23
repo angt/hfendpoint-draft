@@ -1,79 +1,133 @@
+import asyncio
+import inspect
+import sys
 import os
-import select
 import msgpack
+import socket
 
 class WorkerError(Exception):
     pass
 
-def run(handler):
-    fd = int(os.environ["HFENDPOINT_FD"])
-    unpacker = msgpack.Unpacker()
-    reply_buffer = bytearray()
-    reply_buffer_offset = 0
+class HfEndpoint:
+    """
+    An asyncio-based worker for handling requests from the hfendpoint Rust server.
+    """
+    def __init__(self):
+        self._handlers = {}
 
-    def send_chunk(request_id, chunk):
-        nonlocal reply_buffer
-        reply_message = {"id": request_id, "data": chunk}
-        reply_packed = msgpack.packb(reply_message, use_bin_type=True)
-        reply_buffer.extend(reply_packed)
+    def error(self, message):
+        print(message, file=sys.stderr)
 
-    def send_error(request_id, error_message):
-        nonlocal reply_buffer
-        error_reply = {"id": request_id, "error": error_message}
-        error_packed = msgpack.packb(error_reply, use_bin_type=True)
-        reply_buffer.extend(error_packed)
+    def handler(self, name):
+        def decorator(func):
+            self._handlers[name] = func
+            return func
+        return decorator
 
-    read_fds = [fd]
+    async def _writer_loop(self, writer, queue):
+        """
+        A dedicated task that gets messages from the queue and writes them
+        to the output stream. It stops when it receives a `None` sentinel.
+        """
+        try:
+            while True:
+                message = await queue.get()
+                if message is None:
+                    break
+                writer.write(message)
+                while not queue.empty():
+                    try:
+                        item = queue.get_nowait()
+                        if item is None:
+                            await queue.put(None)
+                            break
+                        writer.write(item)
+                    except asyncio.QueueEmpty:
+                        break
+                await writer.drain()
 
-    try:
-        while True:
-            write_fds = [fd] if len(reply_buffer) > reply_buffer_offset else []
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if not writer.is_closing():
+                writer.close()
+                await writer.wait_closed()
 
-            if not read_fds and not write_fds:
-                break
+    async def _handle_request(self, queue, request):
+        """
+        Processes a single request and puts the response(s) onto the queue.
+        """
+        request_id = request.get("id")
+        if request_id is None:
+            self.error(f"Received request without id: {request}")
+            return
 
-            readable, writable, _ = select.select(read_fds, write_fds, [])
+        async def send_chunk(chunk_data):
+            reply = {"id": request_id, "data": chunk_data}
+            packed_reply = msgpack.packb(reply, use_bin_type=True)
+            await queue.put(packed_reply)
 
-            if fd in readable:
-                data = os.read(fd, 1024*1024)
+        try:
+            request_name = request.get("name")
+            request_data = request.get("data")
+            handler_func = self._handlers.get(request_name)
+
+            if not handler_func:
+                raise WorkerError(f"No handler implemented for '{request_name}'")
+
+            result = handler_func(request_data)
+
+            if inspect.isasyncgen(result):
+                async for chunk in result:
+                    await send_chunk(chunk)
+            elif inspect.iscoroutine(result):
+                response = await result
+                await send_chunk(response)
+            else:
+                await send_chunk(result)
+
+        except Exception as e:
+            reply = {"id": request_id, "error": str(e)}
+            packed_reply = msgpack.packb(reply, use_bin_type=True)
+            await queue.put(packed_reply)
+
+    async def run(self):
+        """
+        The main entry point for the worker.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            sock = socket.socket(fileno=int(os.environ["HFENDPOINT_FD"]))
+            reader, writer = await asyncio.open_connection(sock=sock)
+        except Exception as e:
+            self.error(f"Worker failed to open connection: {e}")
+            return
+
+        response_queue = asyncio.Queue()
+        writer_task = loop.create_task(self._writer_loop(writer, response_queue))
+        unpacker = msgpack.Unpacker()
+        active_tasks = set()
+
+        try:
+            while not reader.at_eof():
+                data = await reader.read(1024 * 1024)
                 if not data:
-                    read_fds = []
-                    continue
+                    break
                 unpacker.feed(data)
                 for message in unpacker:
-                    try:
-                        request_id = message["id"]
-                        request_name = message["name"]
-                        request_data = message["data"]
+                    task = loop.create_task(self._handle_request(response_queue, message))
+                    active_tasks.add(task)
+                    task.add_done_callback(active_tasks.discard)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            self.error("Main run loop encountered a fatal error")
+        finally:
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+            await response_queue.put(None)
+            await writer_task
 
-                        if request_name in handler:
-                            handler[request_name](
-                                request_data,
-                                lambda chunk, rid=request_id: send_chunk(rid, chunk)
-                            )
-                        else:
-                            print(f"No handler for {request_name}")
-                    except WorkerError as e:
-                        if request_id is not None:
-                            error_msg = str(e)
-                            print(f"WorkerError for request {request_id}: {error_msg}")
-                            send_error(request_id, error_msg)
-                        else:
-                            print(f"WorkerError occurred but could not determine request ID: {e}")
-                    except Exception as e:
-                        print(f"Error processing request {request_id}: {e}")
-
-            if fd in writable:
-                data_to_send = memoryview(reply_buffer)[reply_buffer_offset:]
-                written = os.write(fd, data_to_send)
-                del data_to_send
-                if written > 0:
-                    reply_buffer_offset += written
-                if reply_buffer_offset == len(reply_buffer):
-                    del reply_buffer[:]
-                    reply_buffer_offset = 0
-
-    except Exception as e:
-        print(f"Worker error: {e}")
-    finally:
-        os.close(fd)
+_hfendpoint = HfEndpoint()
+handler = _hfendpoint.handler
+run = _hfendpoint.run
