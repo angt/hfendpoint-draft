@@ -927,6 +927,10 @@ fn socketpair(buffer_size: usize) -> Result<(UnixStream, UnixStream), Box<dyn st
     Ok((server, worker))
 }
 
+async fn health() -> impl IntoResponse {
+    StatusCode::OK
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
@@ -1017,6 +1021,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let app = Router::new()
+        .route("/", get(health))
+        .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
