@@ -59,7 +59,7 @@ setup(
     description="hfendpoint lib",
     author="angt",
     author_email="angt@hf.co",
-    python_requires=">=3.12",
+    python_requires=">=3.11",
     install_requires=["msgpack"],
     py_modules=["hfendpoint"],
     cmdclass={
