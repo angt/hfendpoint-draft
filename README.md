@@ -18,7 +18,7 @@ if performance becomes a concern.
 
 ### From pip
 
-    uv pip install git+https://github.com/angt/hfendpoint-draft@v0.2.0#subdirectory=bindings/python
+    uv pip install git+https://github.com/angt/hfendpoint-draft@v0.3.0#subdirectory=bindings/python
 
 ### From Precompiled Binaries
 
