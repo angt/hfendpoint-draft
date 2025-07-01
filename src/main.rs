@@ -291,6 +291,36 @@ struct ChatResponse {
     choices: Vec<ChatChoice>,
 }
 
+#[derive(Deserialize)]
+struct ResponsesRequest {
+    input: String,
+    model: String,
+    stream: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ResponseObject {
+    id: String,
+    object: String,
+    created_at: i64,
+    model: String,
+    status: String,
+    output: Vec<ResponseMessage>,
+}
+
+#[derive(Serialize)]
+struct ResponseMessage {
+    r#type: String,
+    role: String,
+    content: Vec<ResponseContent>,
+}
+
+#[derive(Serialize)]
+struct ResponseContent {
+    r#type: String,
+    text: String,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 enum EmbeddingInput {
@@ -776,16 +806,13 @@ async fn chat_completions(
     if is_stream {
         Ok(Sse::new(stream_chat(worker)).into_response())
     } else {
-        let mut message = ChatMessage {
-            role: Some("assistant".into()),
-            content: Some(String::new()),
-        };
+        let mut text = String::new();
         let finish_reason: Option<String>;
         loop {
             match worker.next::<WorkerChatResponse>().await {
                 Ok(chunk) => {
                     if let Some(content) = chunk.content {
-                        message.content.as_mut().unwrap().push_str(&content);
+                        text.push_str(&content);
                     }
                     if chunk.finish_reason.is_some() {
                         finish_reason = chunk.finish_reason;
@@ -804,10 +831,256 @@ async fn chat_completions(
             model: None,
             choices: vec![ChatChoice::Message(ChatChoiceMessage {
                 index: 0,
-                message,
+                message: ChatMessage {
+                    role: Some("assistant".into()),
+                    content: Some(text),
+                },
                 finish_reason,
                 logprobs: None,
             })],
+        })
+        .into_response())
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct ResponseData {
+    id: String,
+    object: String,
+    created_at: i64,
+    status: String,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<Vec<ItemData>>,
+}
+
+#[derive(Serialize, Clone)]
+struct ItemData {
+    id: String,
+    r#type: String,
+    status: String,
+    role: String,
+    content: Vec<PartData>,
+}
+
+#[derive(Serialize, Clone)]
+struct PartData {
+    r#type: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum StreamEvent {
+    Response {
+        response: ResponseData,
+    },
+    ItemAdded {
+        output_index: u32,
+        item: ItemData,
+    },
+    PartAdded {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        part: PartData,
+    },
+    Delta {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        delta: String,
+    },
+    TextDone {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        text: String,
+    },
+    ItemDone {
+        output_index: u32,
+        item: ItemData,
+    },
+}
+
+impl StreamEvent {
+    fn event(self, event_name: &str) -> Result<Event, ApiError> {
+        let mut data = serde_json::json!({ "type": event_name });
+
+        let payload = serde_json::to_value(self).unwrap();
+
+        if let serde_json::Value::Object(payload) = payload {
+            data.as_object_mut().unwrap().extend(payload);
+        }
+        let json = serde_json::to_string(&data).map_err(ApiError::Json)?;
+
+        Ok(Event::default().event(event_name).data(json))
+    }
+}
+
+fn stream_responses(
+    mut worker: Worker,
+    model: String,
+) -> Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send>> {
+    Box::pin(async_stream::stream! {
+        let response_id = format!("resp_{}", worker.id);
+        let item_id = format!("msg_{}", worker.id);
+        let created_at = Utc::now().timestamp();
+
+        let response = ResponseData {
+            id: response_id.clone(),
+            object: "response".into(),
+            created_at,
+            status: "in_progress".into(),
+            model: model.clone(),
+            output: Some(vec![]),
+        };
+        yield StreamEvent::Response { response: response.clone() }
+            .event("response.created");
+
+        yield StreamEvent::Response { response }
+            .event("response.in_progress");
+
+        yield StreamEvent::ItemAdded {
+            output_index: 0,
+            item: ItemData {
+                id: item_id.clone(),
+                r#type: "message".into(),
+                status: "in_progress".into(),
+                role: "assistant".into(),
+                content: vec![],
+            }
+        }.event("response.output_item.added");
+
+        yield StreamEvent::PartAdded {
+            item_id: item_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            part: PartData {
+                r#type: "output_text".into(),
+                text: "".into()
+            }
+        }.event("response.content_part.added");
+
+        let mut text = String::new();
+        loop {
+            match worker.next::<WorkerChatResponse>().await {
+                Ok(chunk) => {
+                    let is_final = chunk.finish_reason.is_some();
+
+                    if let Some(delta) = chunk.content {
+                        text.push_str(&delta);
+
+                        yield StreamEvent::Delta {
+                            item_id: item_id.clone(),
+                            output_index: 0,
+                            content_index: 0,
+                            delta: delta.clone(),
+                        }.event("response.output_text.delta");
+                    }
+                    if is_final {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Error during streaming: {}", e);
+                    break;
+                }
+            }
+        }
+        yield StreamEvent::TextDone {
+            item_id: item_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            text: text.clone(),
+        }.event("response.output_text.done");
+
+        let part = PartData {
+            r#type: "output_text".into(),
+            text: text.clone()
+        };
+        yield StreamEvent::PartAdded {
+            item_id: item_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            part: part.clone(),
+        }.event("response.content_part.done");
+
+        let item = ItemData {
+            id: item_id.clone(),
+            r#type: "message".into(),
+            status: "completed".into(),
+            role: "assistant".into(),
+            content: vec![part],
+        };
+        yield StreamEvent::ItemDone {
+            output_index: 0,
+            item: item.clone(),
+        }.event("response.output_item.done");
+
+        yield StreamEvent::Response {
+            response: ResponseData {
+                id: response_id,
+                object: "response".into(),
+                created_at,
+                status: "completed".into(),
+                model: model,
+                output: Some(vec![item]),
+            }
+        }.event("response.completed");
+    })
+}
+
+async fn responses(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ResponsesRequest>,
+) -> Result<Response, ApiError> {
+    #[derive(Serialize)]
+    struct WorkerRequest {
+        messages: Vec<ChatMessage>,
+    }
+    let request = WorkerRequest {
+        messages: vec![ChatMessage {
+            role: Some("user".into()),
+            content: Some(payload.input),
+        }],
+    };
+    let is_stream = payload.stream.unwrap_or(false);
+    let mut worker = state.call("chat_completions", request, 10).await?;
+
+    if is_stream {
+        Ok(Sse::new(stream_responses(worker, payload.model)).into_response())
+    } else {
+        let mut text = String::new();
+        loop {
+            match worker.next::<WorkerChatResponse>().await {
+                Ok(chunk) => {
+                    if let Some(content) = chunk.content {
+                        text.push_str(&content);
+                    }
+                    if chunk.finish_reason.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Json(ResponseObject {
+            id: format!("resp_{}", worker.id),
+            object: "response".into(),
+            created_at: Utc::now().timestamp(),
+            model: payload.model,
+            status: "completed".into(),
+            output: vec![ResponseMessage {
+                r#type: "message".into(),
+                role: "assistant".into(),
+                content: vec![ResponseContent {
+                    r#type: "output_text".to_string(),
+                    text: text,
+                }],
+            }],
         })
         .into_response())
     }
@@ -1023,6 +1296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(health))
         .route("/health", get(health))
+        .route("/v1/responses", post(responses))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_editions))
