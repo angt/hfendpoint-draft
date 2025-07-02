@@ -761,16 +761,9 @@ fn stream_chat(mut worker: Worker) -> Pin<Box<dyn Stream<Item = Result<Event, Ap
                             logprobs: None,
                         })],
                     };
-                    match serde_json::to_string(&resp) {
-                        Ok(json) => {
-                            yield Ok(Event::default().data(json));
-                        }
-                        Err(e) => {
-                            let api_err = ApiError::Json(e);
-                            error!(error = %api_err, "SSE serialization error");
-                            break;
-                        }
-                    }
+                    let json = serde_json::to_string(&resp).map_err(ApiError::Json)?;
+                    yield Ok(Event::default().data(json));
+
                     if is_final {
                         break;
                     }
@@ -963,27 +956,38 @@ fn stream_responses(
         }.event("response.content_part.added");
 
         let mut text = String::new();
+        let mut finish_reason: Option<String> = None;
         loop {
             match worker.next::<WorkerChatResponse>().await {
                 Ok(chunk) => {
-                    let is_final = chunk.finish_reason.is_some();
-
                     if let Some(delta) = chunk.content {
                         text.push_str(&delta);
-
                         yield StreamEvent::Delta {
                             item_id: item_id.clone(),
                             output_index: 0,
                             content_index: 0,
-                            delta: delta.clone(),
+                            delta: delta,
                         }.event("response.output_text.delta");
                     }
-                    if is_final {
+                    if chunk.finish_reason.is_some() {
+                        finish_reason = chunk.finish_reason;
                         break;
                     }
                 }
                 Err(e) => {
-                    error!("Error during streaming: {}", e);
+                    error!(error = %e, "Error during streaming response");
+
+                    let resp = ApiErrorResponse {
+                        error: ApiErrorDetail {
+                            message: "The server had an error while processing your stream.".to_string(),
+                            r#type: "api_error",
+                            param: None,
+                            code: None,
+                        },
+                    };
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        yield Ok(Event::default().event("error").data(json));
+                    }
                     break;
                 }
             }
@@ -997,7 +1001,7 @@ fn stream_responses(
 
         let part = PartData {
             r#type: "output_text".into(),
-            text: text.clone()
+            text: text,
         };
         yield StreamEvent::PartAdded {
             item_id: item_id.clone(),
@@ -1006,10 +1010,15 @@ fn stream_responses(
             part: part.clone(),
         }.event("response.content_part.done");
 
+        let status = match finish_reason.as_deref() {
+            Some("stop") | Some("length") => "completed",
+            _ => "failed",
+        }.to_string();
+
         let item = ItemData {
             id: item_id.clone(),
             r#type: "message".into(),
-            status: "completed".into(),
+            status: status.clone(),
             role: "assistant".into(),
             content: vec![part],
         };
@@ -1023,7 +1032,7 @@ fn stream_responses(
                 id: response_id,
                 object: "response".into(),
                 created_at,
-                status: "completed".into(),
+                status,
                 model: model,
                 output: Some(vec![item]),
             }
@@ -1052,6 +1061,7 @@ async fn responses(
         Ok(Sse::new(stream_responses(worker, payload.model)).into_response())
     } else {
         let mut text = String::new();
+        let mut finish_reason: Option<String> = None;
         loop {
             match worker.next::<WorkerChatResponse>().await {
                 Ok(chunk) => {
@@ -1059,6 +1069,7 @@ async fn responses(
                         text.push_str(&content);
                     }
                     if chunk.finish_reason.is_some() {
+                        finish_reason = chunk.finish_reason;
                         break;
                     }
                 }
@@ -1067,12 +1078,17 @@ async fn responses(
                 }
             }
         }
+        let status = match finish_reason.as_deref() {
+            Some("stop") | Some("length") => "completed",
+            _ => "failed",
+        }.to_string();
+
         Ok(Json(ResponseObject {
             id: format!("resp_{}", worker.id),
             object: "response".into(),
             created_at: Utc::now().timestamp(),
             model: payload.model,
-            status: "completed".into(),
+            status,
             output: vec![ResponseMessage {
                 r#type: "message".into(),
                 role: "assistant".into(),
